@@ -4,6 +4,7 @@ use burn::tensor::backend::Backend;
 
 use crate::layer::QuantCBLayer;
 use crate::model::QuantCB;
+use crate::mtp::MTPConfig; // New import
 
 #[derive(Config)]
 pub struct QuantCBConfig {
@@ -15,8 +16,6 @@ pub struct QuantCBConfig {
     pub top_k: usize,
     pub max_seq_len: usize,
     pub dropout: f64,
-    
-    // New MLA Architecture Parameters
     pub d_c: usize,
     pub d_c_q: usize,
     pub d_head_c: usize,
@@ -34,11 +33,20 @@ impl QuantCBConfig {
         let norm_f = LayerNormConfig::new(self.d_model).init(device);
         let output = LinearConfig::new(self.d_model, self.vocab_size).init(device);
 
+        // Initialize MTP module
+        let mtp_config = MTPConfig {
+            d_model: self.d_model,
+            n_heads: self.n_heads,
+            vocab_size: self.vocab_size,
+        };
+        let mtp = mtp_config.init(device);
+
         QuantCB {
             token_embedding,
             layers,
             norm_f,
             output,
+            mtp,
         }
     }
 }
