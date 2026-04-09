@@ -33,7 +33,6 @@ impl QuantCBConfig {
         let norm_f = RmsNormConfig::new(self.d_model).init(device);
         let output = LinearConfig::new(self.d_model, self.vocab_size).init(device);
 
-        // Initialize MTP module
         let mtp_config = MTPConfig {
             d_model: self.d_model,
             n_heads: self.n_heads,
@@ -41,8 +40,11 @@ impl QuantCBConfig {
         };
         let mtp = mtp_config.init(device);
 
-        // Initialize Hallucination Probe
         let hallucination_probe = LinearConfig::new(self.d_model, 1).init(device);
+
+        // Initialize the Thinking Gate
+        // This projects the hidden state to a single value to control feedback
+        let thinking_gate = LinearConfig::new(self.d_model, 1).init(device);
 
         QuantCB {
             token_embedding,
@@ -51,6 +53,7 @@ impl QuantCBConfig {
             output,
             mtp,
             hallucination_probe,
+            thinking_gate,
         }
     }
 }

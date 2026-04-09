@@ -14,53 +14,65 @@ pub struct QuantCB<B: Backend> {
     pub norm_f: RmsNorm<B>,
     pub output: Linear<B>,
     pub mtp: MultiTokenPrediction<B>, 
-    pub hallucination_probe: Linear<B>, // The new probe
+    pub hallucination_probe: Linear<B>,
+    pub thinking_gate: Linear<B>, // The new Gate
 }
 
 impl<B: Backend> QuantCB<B> {
-    /// Standard forward pass
-    /// Returns (Logits, Hallucination Probability)
-    pub fn forward(&self, input: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let mut x = self.token_embedding.forward(input);
-
+    /// Helper to pass a tensor through the transformer layer stack
+    fn process_layers(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
         for layer in &self.layers {
             x = layer.forward(x);
         }
+        x
+    }
 
-        let h_base = self.norm_f.forward(x);
+    /// Standard forward pass with Gated Recurrent Feedback
+    pub fn forward(&self, input: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
+        let x_emb = self.token_embedding.forward(input);
+
+        // --- Pass 1: Initial "Thought" ---
+        let h_initial = self.process_layers(x_emb.clone());
+
+        // --- Gated Feedback Mechanism ---
+        // Calculate gate value (0.0 to 1.0) based on the initial pass
+        let gate = sigmoid(self.thinking_gate.forward(h_initial.clone()));
+        
+        // Recurrent Feedback: Mix original embedding with processed state
+        let x_refined = x_emb + (h_initial * gate.clone());
+
+        // --- Pass 2: Refined Processing ---
+        let x_final = self.process_layers(x_refined);
+
+        let h_base = self.norm_f.forward(x_final);
         let logits = self.output.forward(h_base.clone());
 
-        // Probe: project hidden state to 1, then apply sigmoid for probability
         let probe_logits = self.hallucination_probe.forward(h_base);
         let hallucination_probs = sigmoid(probe_logits);
 
-        (logits, hallucination_probs)
+        (logits, hallucination_probs, gate)
     }
 
-    /// Forward pass with Multi-Token Prediction (Training/Verification)
-    /// Returns (Main Logits, MTP Logits, MTP Loss, Hallucination Probability)
+    /// Forward pass with Multi-Token Prediction and Thinking Gate
     pub fn forward_mtp(
         &self,
         input: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>) {
-        let mut x = self.token_embedding.forward(input);
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>) {
+        let x_emb = self.token_embedding.forward(input);
 
-        for layer in &self.layers {
-            x = layer.forward(x);
-        }
+        // Recurrent logic repeated for MTP branch consistency
+        let h_initial = self.process_layers(x_emb.clone());
+        let gate = sigmoid(self.thinking_gate.forward(h_initial.clone()));
+        let x_refined = x_emb + (h_initial * gate.clone());
+        let x_final = self.process_layers(x_refined);
 
-        // Hidden state used for main prediction, MTP fusion, and the probe
-        let h_base = self.norm_f.forward(x);
-        
-        // Main branch: predicts t+1
+        let h_base = self.norm_f.forward(x_final);
         let main_logits = self.output.forward(h_base.clone());
 
-        // Probe branch
         let probe_logits = self.hallucination_probe.forward(h_base.clone());
         let hallucination_probs = sigmoid(probe_logits);
 
-        // MTP branch: predicts t+2 using h_base and t+1 targets
         let (mtp_logits, mtp_loss) = self.mtp.forward(
             h_base,
             targets,
@@ -68,6 +80,6 @@ impl<B: Backend> QuantCB<B> {
             &self.output,
         );
 
-        (main_logits, mtp_logits, mtp_loss, hallucination_probs)
+        (main_logits, mtp_logits, mtp_loss, hallucination_probs, gate)
     }
 }

@@ -15,37 +15,42 @@ fn main() {
 
     println!("QuantCB 2.0 | Backend: Vulkan (WGPU)");
 
+    // Initialize config with current architectural parameters
     let config = QuantCBConfig::new(
         10000, 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16,
     );
 
     let model = config.init::<Backend>(&device);
-    println!("Model with MTP and Hallucination Probe initialized successfully.");
+    println!("Model with Thinking Gate and Recurrent Feedback initialized.");
 
-    // Dummy input: Tokens [1..10]
+    // Dummy input: Batch of 2, Sequence of 10
     let dummy_input = Tensor::<Backend, 2, Int>::from_data(
         [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]],
         &device,
     );
 
-    // Dummy targets: Tokens [2..11] (t+1 tokens for MTP "hint")
+    // Dummy targets: Tokens shifted by 1 for MTP hint/loss
     let dummy_targets = Tensor::<Backend, 2, Int>::from_data(
         [[2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]],
         &device,
     );
 
-    // Run Standard Forward
-    let (output, probe_probs) = model.forward(dummy_input.clone());
+    // --- Run Standard Forward ---
+    // Returns: (Logits, Hallucination Probs, Thinking Gate)
+    let (output, _probe_probs, think_gate) = model.forward(dummy_input.clone());
+    
     println!("Standard Output shape: {:?}", output.dims());
-    println!("Probe Score shape:     {:?}", probe_probs.dims()); // Expected: [2, 10, 1]
+    println!("Thinking Gate shape:   {:?}", think_gate.dims()); // Expected [2, 10, 1]
 
-    // Run MTP Test
+    // --- Run MTP Test ---
     println!("\n--- Testing MTP System ---");
-    let (main_logits, mtp_logits, mtp_loss, mtp_probe_probs) = model.forward_mtp(dummy_input, dummy_targets);
+    // Returns: (Main Logits, MTP Logits, MTP Loss, Hallucination Probs, Thinking Gate)
+    let (main_logits, _mtp_logits, mtp_loss, _mtp_probe_probs, mtp_think_gate) = 
+        model.forward_mtp(dummy_input, dummy_targets);
 
-    println!("Main Logits shape: {:?}", main_logits.dims());
-    println!("MTP Logits shape:  {:?}", mtp_logits.dims());
-    println!("MTP Probe shape:   {:?}", mtp_probe_probs.dims());
-    println!("MTP Loss:          {:?}", mtp_loss.into_data());
-    println!("Verification Complete.");
+    println!("Main Logits shape:     {:?}", main_logits.dims());
+    println!("Thinking Gate (MTP):   {:?}", mtp_think_gate.dims());
+    println!("MTP Loss:              {:?}", mtp_loss.into_data());
+    
+    println!("\nVerification Complete: Dual-pass refinement and gated feedback functional.");
 }
