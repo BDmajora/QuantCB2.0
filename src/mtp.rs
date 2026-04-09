@@ -1,7 +1,7 @@
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::nn::{Embedding, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Embedding, RmsNorm, RmsNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
@@ -18,13 +18,16 @@ pub struct MultiTokenPrediction<B: Backend> {
     // Fusion Projections
     pub proj_h: Linear<B>,
     pub proj_emb: Linear<B>,
-    pub ln_fusion: LayerNorm<B>,
+    // Swapped to RmsNorm
+    pub ln_fusion: RmsNorm<B>,
 
     // Transformer Block
-    pub norm1: LayerNorm<B>,
+    // Swapped to RmsNorm
+    pub norm1: RmsNorm<B>,
     pub attn_qkv: Linear<B>,
     pub attn_out: Linear<B>,
-    pub norm2: LayerNorm<B>,
+    // Swapped to RmsNorm
+    pub norm2: RmsNorm<B>,
     pub mlp_fc1: Linear<B>,
     pub mlp_fc2: Linear<B>,
 
@@ -40,14 +43,17 @@ impl MTPConfig {
             // Additive fusion linear layers
             proj_h: LinearConfig::new(d_model, d_model).with_bias(false).init(device),
             proj_emb: LinearConfig::new(d_model, d_model).with_bias(false).init(device),
-            ln_fusion: LayerNormConfig::new(d_model).init(device),
+            // Swapped to RmsNormConfig
+            ln_fusion: RmsNormConfig::new(d_model).init(device),
 
             // Transformer block
-            norm1: LayerNormConfig::new(d_model).init(device),
+            // Swapped to RmsNormConfig
+            norm1: RmsNormConfig::new(d_model).init(device),
             attn_qkv: LinearConfig::new(d_model, d_model * 3).init(device),
             attn_out: LinearConfig::new(d_model, d_model).init(device),
             
-            norm2: LayerNormConfig::new(d_model).init(device),
+            // Swapped to RmsNormConfig
+            norm2: RmsNormConfig::new(d_model).init(device),
             // Assuming standard MLP expansion ratio of 4
             mlp_fc1: LinearConfig::new(d_model, d_model * 4).init(device),
             mlp_fc2: LinearConfig::new(d_model * 4, d_model).init(device),

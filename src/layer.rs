@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::{LayerNorm, LayerNormConfig};
+use burn::nn::{RmsNorm, RmsNormConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
@@ -12,8 +12,9 @@ use crate::moe::MoELayer;
 pub struct QuantCBLayer<B: Backend> {
     mla: MultiHeadLatentAttention<B>,
     moe: MoELayer<B>,
-    norm1: LayerNorm<B>,
-    norm2: LayerNorm<B>,
+    // Swapped to RmsNorm
+    norm1: RmsNorm<B>,
+    norm2: RmsNorm<B>,
 }
 
 impl<B: Backend> QuantCBLayer<B> {
@@ -30,8 +31,9 @@ impl<B: Backend> QuantCBLayer<B> {
         Self {
             mla: mla_config.init(device),
             moe: MoELayer::init(config.d_model, config.n_experts, config.top_k, device),
-            norm1: LayerNormConfig::new(config.d_model).init(device),
-            norm2: LayerNormConfig::new(config.d_model).init(device),
+            // Swapped to RmsNormConfig
+            norm1: RmsNormConfig::new(config.d_model).init(device),
+            norm2: RmsNormConfig::new(config.d_model).init(device),
         }
     }
 

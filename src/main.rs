@@ -3,7 +3,7 @@ mod layer;
 mod mla;
 mod moe;
 mod model;
-mod mtp; // Ensure mtp module is registered
+mod mtp; 
 
 use burn::backend::Wgpu;
 use burn::tensor::{Int, Tensor};
@@ -20,7 +20,7 @@ fn main() {
     );
 
     let model = config.init::<Backend>(&device);
-    println!("Model with MTP initialized successfully.");
+    println!("Model with MTP and Hallucination Probe initialized successfully.");
 
     // Dummy input: Tokens [1..10]
     let dummy_input = Tensor::<Backend, 2, Int>::from_data(
@@ -35,15 +35,17 @@ fn main() {
     );
 
     // Run Standard Forward
-    let output = model.forward(dummy_input.clone());
+    let (output, probe_probs) = model.forward(dummy_input.clone());
     println!("Standard Output shape: {:?}", output.dims());
+    println!("Probe Score shape:     {:?}", probe_probs.dims()); // Expected: [2, 10, 1]
 
     // Run MTP Test
     println!("\n--- Testing MTP System ---");
-    let (main_logits, mtp_logits, mtp_loss) = model.forward_mtp(dummy_input, dummy_targets);
+    let (main_logits, mtp_logits, mtp_loss, mtp_probe_probs) = model.forward_mtp(dummy_input, dummy_targets);
 
     println!("Main Logits shape: {:?}", main_logits.dims());
     println!("MTP Logits shape:  {:?}", mtp_logits.dims());
+    println!("MTP Probe shape:   {:?}", mtp_probe_probs.dims());
     println!("MTP Loss:          {:?}", mtp_loss.into_data());
-    println!("MTP Verification Complete.");
+    println!("Verification Complete.");
 }

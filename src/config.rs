@@ -1,10 +1,10 @@
 use burn::config::Config;
-use burn::nn::{EmbeddingConfig, LayerNormConfig, LinearConfig};
+use burn::nn::{EmbeddingConfig, RmsNormConfig, LinearConfig};
 use burn::tensor::backend::Backend;
 
 use crate::layer::QuantCBLayer;
 use crate::model::QuantCB;
-use crate::mtp::MTPConfig; // New import
+use crate::mtp::MTPConfig;
 
 #[derive(Config)]
 pub struct QuantCBConfig {
@@ -30,7 +30,7 @@ impl QuantCBConfig {
             .map(|_| QuantCBLayer::init(self, device))
             .collect();
 
-        let norm_f = LayerNormConfig::new(self.d_model).init(device);
+        let norm_f = RmsNormConfig::new(self.d_model).init(device);
         let output = LinearConfig::new(self.d_model, self.vocab_size).init(device);
 
         // Initialize MTP module
@@ -41,12 +41,16 @@ impl QuantCBConfig {
         };
         let mtp = mtp_config.init(device);
 
+        // Initialize Hallucination Probe
+        let hallucination_probe = LinearConfig::new(self.d_model, 1).init(device);
+
         QuantCB {
             token_embedding,
             layers,
             norm_f,
             output,
             mtp,
+            hallucination_probe,
         }
     }
 }
