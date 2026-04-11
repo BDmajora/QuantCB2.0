@@ -20,7 +20,7 @@ pub struct QuantCBConfig {
     pub d_c_q: usize,
     pub d_head_c: usize,
     pub d_rope: usize,
-    pub num_recurrent_steps: usize,
+    pub loop_depth: usize, // Changed from num_recurrent_steps
 }
 
 impl QuantCBConfig {
@@ -53,7 +53,7 @@ impl QuantCBConfig {
             mtp,
             hallucination_probe,
             thinking_gate,
-            num_recurrent_steps: self.num_recurrent_steps,
+            loop_depth: self.loop_depth, // Mapping to the new field name
         }
     }
 }

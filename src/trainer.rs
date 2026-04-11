@@ -1,3 +1,4 @@
+// src/trainer.rs
 use std::time::Instant;
 use burn::optim::{Optimizer, GradientsParams};
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -9,20 +10,21 @@ use burn::backend::{Autodiff, Wgpu};
 use crate::trainer_config::TrainingConfig; 
 use crate::model::QuantCB;
 use crate::batcher::{QuantCBBatch, QuantCBBatcher};
-use crate::tokenizer::CharacterTokenizer;
+use crate::tokenizer::BPETokenizer; // Updated Tokenizer
 use crate::dataset::TextDataset;
 use crate::training_data::{TrainingDataSources, TAG_TRUTH, TAG_SHAKESPEARE};
-use crate::generator::TextGenerator; // New Import
+use crate::generator::TextGenerator; 
 
 pub struct QuantCBTrainer<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> {
     pub model: QuantCB<B>,
     pub optimizer: O,
     pub lr: f64,
+    pub entropy_reg_weight: f32, 
 }
 
 impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
-    pub fn new(model: QuantCB<B>, optimizer: O, lr: f64) -> Self {
-        Self { model, optimizer, lr }
+    pub fn new(model: QuantCB<B>, optimizer: O, lr: f64, entropy_reg_weight: f32) -> Self {
+        Self { model, optimizer, lr, entropy_reg_weight }
     }
 
     pub fn train_step(&mut self, batch: QuantCBBatch<B>) -> f32 {
@@ -36,7 +38,9 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         let targets_flat = batch.targets.reshape([batch_size * seq_len]);
         let main_loss = loss_fn.forward(logits_flat, targets_flat);
 
-        let total_loss = main_loss + mtp_loss.mul_scalar(0.3) + aux_loss.mul_scalar(1.0);
+        let total_loss = main_loss 
+            + mtp_loss.mul_scalar(0.3) 
+            + aux_loss.mul_scalar(self.entropy_reg_weight);
         
         let grads = total_loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.model);
@@ -51,12 +55,33 @@ pub fn run() {
     let device: <TrainBackend as Backend>::Device = Default::default();
 
     let raw_text = TrainingDataSources::load_tiny_shakespeare();
-    let tokenizer = CharacterTokenizer::new(&raw_text);
     
+    // Initialize tokenizer with special tokens to bypass byte-splitting
+    let special_tags = vec![TAG_TRUTH, TAG_SHAKESPEARE];
+    let mut tokenizer = BPETokenizer::new(&special_tags);
+    
+    // Train the BPE Tokenizer up to an arbitrary 2048 vocab size
+    println!("Training BPE Tokenizer...");
+    tokenizer.train(&raw_text, 2048);
+
+    let model_config = crate::config::QuantCBConfig::new(
+        tokenizer.vocab_size(), 
+        256,                    
+        8,                      
+        4,                      
+        8,                      
+        2,                      
+        512,                    
+        0.1,                    
+        64,                     
+        64,                     
+        16,                     
+        16,                     
+        2,                      
+    );
+
     let config = TrainingConfig::new(
-        crate::config::QuantCBConfig::new(
-            tokenizer.vocab_size(), 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16, 2
-        ),
+        model_config,
         burn::optim::AdamConfig::new(),
     );
 
@@ -67,11 +92,19 @@ pub fn run() {
         .shuffle(config.seed)
         .build(dataset);
 
-    let model = config.model.init::<TrainBackend>(&device);
-    let optimizer = config.optimizer.init();
-    let mut trainer = QuantCBTrainer::new(model, optimizer, config.learning_rate);
+    let mut model = config.model.init::<TrainBackend>(&device);
+    
+    model.loop_depth = config.loop_depth;
 
-    println!("\n--- Launching Optimized Vulkan Pipeline ---");
+    let optimizer = config.optimizer.init();
+    let mut trainer = QuantCBTrainer::new(
+        model, 
+        optimizer, 
+        config.learning_rate, 
+        config.entropy_reg_weight
+    );
+
+    println!("\n--- Launching LoopLM (Ouro) Training Pipeline ---");
     let mut t0 = Instant::now();
     let mut step = 0;
 
@@ -87,7 +120,6 @@ pub fn run() {
 
         if step > 0 && step % 100 == 0 {
             let prompt = format!("{} {} \nFirst Citizen:", TAG_TRUTH, TAG_SHAKESPEARE);
-            // Use the new Generator class
             let generated = TextGenerator::generate(&trainer.model, &tokenizer, &device, &prompt, 60);
             println!("\n[Sample at Step {}]\n>> {}\n", step, generated);
         }

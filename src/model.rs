@@ -17,7 +17,7 @@ pub struct QuantCB<B: Backend> {
     pub mtp: MultiTokenPrediction<B>, 
     pub hallucination_probe: Linear<B>,
     pub thinking_gate: Linear<B>,
-    pub num_recurrent_steps: usize,
+    pub loop_depth: usize, // Renamed from num_recurrent_steps to match LoopLM nomenclature
 }
 
 impl<B: Backend> QuantCB<B> {
@@ -44,7 +44,7 @@ impl<B: Backend> QuantCB<B> {
         (x, total_routing_loss, updated_caches)
     }
 
-    /// The base forward pass. Now returns h_base so forward_mtp can reuse it.
+    /// LoopLM implementation: Iterative computation in latent space
     pub fn forward(
         &self, 
         input: Tensor<B, 2, Int>,
@@ -60,17 +60,34 @@ impl<B: Backend> QuantCB<B> {
 
         let active_caches = caches.unwrap_or_else(|| KVCache::init_empty_list(self.layers.len()));
 
-        for _ in 0..self.num_recurrent_steps {
+        // LoopLM: Iterative Latent Reasoning Phase
+        for _ in 0..self.loop_depth {
             let (h_out, routing_loss, _) = self.process_layers(
-                current_input, 
+                current_input.clone(), 
                 KVCache::init_empty_list(self.layers.len())
             );
             total_aux_loss = total_aux_loss + routing_loss;
             
+            // Generate depth allocation probability
             gate = sigmoid(self.thinking_gate.forward(h_out.clone()));
+            
+            // LoopLM Paper: Entropy-regularized objective to force confident depth allocation
+            // H(p) = -p*log(p) - (1-p)*log(1-p). We want to minimize this.
+            let p_safe = gate.clone().clamp(1e-7, 1.0 - 1e-7); // Prevent log(0)
+            let one_minus_p_safe = p_safe.clone().neg().add_scalar(1.0);
+            
+            let entropy_term_1 = p_safe.clone().mul(p_safe.log()).neg();
+            let entropy_term_2 = one_minus_p_safe.clone().mul(one_minus_p_safe.log()).neg();
+            let gate_entropy = (entropy_term_1 + entropy_term_2).mean(); 
+            
+            // Accumulate entropy into our auxiliary loss to be regularized by the trainer
+            total_aux_loss = total_aux_loss + gate_entropy;
+
+            // Residual connection weighted by the thinking gate
             current_input = x_emb.clone() + (h_out * gate.clone());
         }
 
+        // Final exit pass
         let (x_final, routing_loss_final, final_caches) = self.process_layers(current_input, active_caches);
         total_aux_loss = total_aux_loss + routing_loss_final;
 
@@ -88,11 +105,9 @@ impl<B: Backend> QuantCB<B> {
         targets: Tensor<B, 2, Int>,
         caches: Option<Vec<Option<KVCache<B>>>>
     ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>) {
-        // Use the base forward pass logic
         let (main_logits, hallucination_probs, gate, total_aux_loss, final_caches, h_base) = 
             self.forward(input, caches);
 
-        // Just add the MTP-specific logic on top
         let (mtp_logits, mtp_loss) = self.mtp.forward(
             h_base,
             targets,
