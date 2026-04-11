@@ -4,6 +4,7 @@ use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+use crate::kv_cache::KVCache;
 
 #[derive(Config, Debug)]
 pub struct MLAConfig {
@@ -65,63 +66,59 @@ impl MLAConfig {
 }
 
 impl<B: Backend> MultiHeadLatentAttention<B> {
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let [batch_size, seq_len, _d_model] = x.dims();
+    pub fn forward(
+        &self, 
+        x: Tensor<B, 3>, 
+        cache: Option<KVCache<B>>
+    ) -> (Tensor<B, 3>, KVCache<B>) {
+        let [batch_size, seq_len_q, _d_model] = x.dims();
 
-        // ==========================================
-        // 1. Query Compression & Projection
-        // ==========================================
+        // 1. Query Projections
         let c_q = self.w_dq.forward(x.clone());
         let q_nope = self.w_uq.forward(c_q.clone()); 
         let q_pe = self.w_qr.forward(c_q);           
 
-        // ==========================================
-        // 2. Key/Value Compression
-        // ==========================================
+        // 2. Key/Value Projections
         let c_kv = self.w_dkv.forward(x.clone());
-        let k_nope = self.w_uk.forward(c_kv.clone()); 
-        let v_nope = self.w_uv.forward(c_kv);         
-        let k_pe = self.w_kr.forward(x);              
+        let k_nope_3d = self.w_uk.forward(c_kv.clone()); 
+        let v_nope_3d = self.w_uv.forward(c_kv);         
+        let k_pe_3d = self.w_kr.forward(x);              
 
-        // ==========================================
-        // 3. Reshape for Multi-Head Attention
-        // ==========================================
-        let q_nope = self.reshape_for_mha(q_nope, batch_size, seq_len, self.d_head_c);
-        let q_pe = self.reshape_for_mha(q_pe, batch_size, seq_len, self.d_rope);
-        
-        let k_nope = self.reshape_for_mha(k_nope, batch_size, seq_len, self.d_head_c);
-        let k_pe = self.reshape_for_mha(k_pe, batch_size, seq_len, self.d_rope);
-        
-        let v = self.reshape_for_mha(v_nope, batch_size, seq_len, self.d_head_c);
+        // Combine NOPE and PE for the 3D cache representation
+        let k_3d = Tensor::cat(vec![k_nope_3d, k_pe_3d], 2);
+        let v_3d = v_nope_3d;
 
-        // ==========================================
-        // 4. Concatenate NOPE and PE parts
-        // ==========================================
+        // 3. Update Memory Cache BEFORE reshaping to 4D
+        let (k_ctx_3d, v_ctx_3d, updated_cache) = KVCache::update(cache, k_3d, v_3d);
+
+        // 4. Reshape for Multi-Head
+        let [_, seq_len_kv, _] = k_ctx_3d.dims();
+
+        let q_nope = self.reshape_for_mha(q_nope, batch_size, seq_len_q, self.d_head_c);
+        let q_pe = self.reshape_for_mha(q_pe, batch_size, seq_len_q, self.d_rope);
         let q = Tensor::cat(vec![q_nope, q_pe], 3);
-        let k = Tensor::cat(vec![k_nope, k_pe], 3);
+        
+        let k_ctx = self.reshape_for_mha(k_ctx_3d, batch_size, seq_len_kv, self.d_head_c + self.d_rope);
+        let v_ctx = self.reshape_for_mha(v_ctx_3d, batch_size, seq_len_kv, self.d_head_c);
 
-        // ==========================================
-        // 5. Scaled Dot-Product Attention
-        // ==========================================
+        // 5. Attention Math
         let scale = 1.0 / ((self.d_head_c + self.d_rope) as f32).sqrt();
         
-        let k_t = k.transpose(); 
+        let k_t = k_ctx.transpose(); 
         let mut attn_scores = q.matmul(k_t).mul_scalar(scale);
 
-        // Apply causal mask
-        attn_scores = self.apply_causal_mask(attn_scores, seq_len);
+        // 6. Causal Masking
+        attn_scores = self.apply_causal_mask(attn_scores, seq_len_q, seq_len_kv);
         let attn_probs = softmax(attn_scores, 3);
 
-        let context = attn_probs.matmul(v); 
+        let context = attn_probs.matmul(v_ctx); 
 
-        // ==========================================
-        // 6. Output Projection
-        // ==========================================
+        // 7. Output Projection
         let context_flat = context
             .swap_dims(1, 2)
-            .reshape([batch_size, seq_len, self.n_heads * self.d_head_c]);
+            .reshape([batch_size, seq_len_q, self.n_heads * self.d_head_c]);
 
-        self.o_proj.forward(context_flat)
+        (self.o_proj.forward(context_flat), updated_cache)
     }
 
     fn reshape_for_mha(
@@ -136,17 +133,23 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
             .swap_dims(1, 2)
     }
 
-    /// Fixed: Uses bool_not() to correctly handle Burn's Bool Tensor API
-    fn apply_causal_mask(&self, scores: Tensor<B, 4>, seq_len: usize) -> Tensor<B, 4> {
+    fn apply_causal_mask(
+        &self, 
+        scores: Tensor<B, 4>, 
+        seq_len_q: usize, 
+        seq_len_kv: usize
+    ) -> Tensor<B, 4> {
         let device = scores.device();
         
-        let mask = Tensor::arange(0..seq_len as i64, &device)
-            .reshape([seq_len, 1])
-            .greater_equal(Tensor::arange(0..seq_len as i64, &device).reshape([1, seq_len]));
+        let offset = seq_len_kv - seq_len_q;
+
+        let mask = Tensor::arange(0..seq_len_q as i64, &device)
+            .reshape([seq_len_q, 1])
+            .add_scalar(offset as i64)
+            .greater_equal(Tensor::arange(0..seq_len_kv as i64, &device).reshape([1, seq_len_kv]));
             
         let mask = mask.unsqueeze::<4>().expand(scores.dims());
 
-        // Inverting the boolean mask to fill future tokens
         scores.mask_fill(mask.bool_not(), f32::NEG_INFINITY)
     }
 }

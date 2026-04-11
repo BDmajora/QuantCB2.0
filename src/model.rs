@@ -6,6 +6,7 @@ use burn::tensor::{Int, Tensor};
 
 use crate::layer::QuantCBLayer;
 use crate::mtp::MultiTokenPrediction; 
+use crate::kv_cache::KVCache;
 
 #[derive(Module, Debug)]
 pub struct QuantCB<B: Backend> {
@@ -15,34 +16,68 @@ pub struct QuantCB<B: Backend> {
     pub output: Linear<B>,
     pub mtp: MultiTokenPrediction<B>, 
     pub hallucination_probe: Linear<B>,
-    pub thinking_gate: Linear<B>, // The new Gate
+    pub thinking_gate: Linear<B>,
+    pub num_recurrent_steps: usize,
 }
 
 impl<B: Backend> QuantCB<B> {
-    /// Helper to pass a tensor through the transformer layer stack
-    fn process_layers(&self, mut x: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn process_layers(
+        &self, 
+        mut x: Tensor<B, 3>, 
+        mut layer_caches: Vec<Option<KVCache<B>>>
+    ) -> (Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>) {
+        let mut total_routing_loss = Tensor::<B, 1>::zeros([1], &x.device());
+        let mut updated_caches = Vec::with_capacity(self.layers.len());
+        
         for layer in &self.layers {
-            x = layer.forward(x);
+            // Extract the cache for the current layer if it exists
+            let current_cache = if layer_caches.is_empty() {
+                None
+            } else {
+                layer_caches.remove(0)
+            };
+            
+            let (out, layer_loss, new_cache) = layer.forward(x, current_cache);
+            x = out;
+            total_routing_loss = total_routing_loss + layer_loss;
+            // FIX: new_cache is already an Option, so we just push it directly
+            updated_caches.push(new_cache);
         }
-        x
+        (x, total_routing_loss, updated_caches)
     }
 
-    /// Standard forward pass with Gated Recurrent Feedback
-    pub fn forward(&self, input: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
+    pub fn forward(
+        &self, 
+        input: Tensor<B, 2, Int>,
+        caches: Option<Vec<Option<KVCache<B>>>>
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>) {
         let x_emb = self.token_embedding.forward(input);
-
-        // --- Pass 1: Initial "Thought" ---
-        let h_initial = self.process_layers(x_emb.clone());
-
-        // --- Gated Feedback Mechanism ---
-        // Calculate gate value (0.0 to 1.0) based on the initial pass
-        let gate = sigmoid(self.thinking_gate.forward(h_initial.clone()));
         
-        // Recurrent Feedback: Mix original embedding with processed state
-        let x_refined = x_emb + (h_initial * gate.clone());
+        let [batch_size, seq_len, _] = x_emb.dims();
+        let device = x_emb.device();
+        
+        let mut current_input = x_emb.clone();
+        let mut gate = Tensor::<B, 3>::zeros([batch_size, seq_len, 1], &device);
+        let mut total_aux_loss = Tensor::<B, 1>::zeros([1], &device);
 
-        // --- Pass 2: Refined Processing ---
-        let x_final = self.process_layers(x_refined);
+        let active_caches = caches.unwrap_or_else(|| KVCache::init_empty_list(self.layers.len()));
+
+        // Recurrent Thinking Steps: We pass empty caches here so intermediate 
+        // states don't pollute the KV memory.
+        for _ in 0..self.num_recurrent_steps {
+            let (h_out, routing_loss, _) = self.process_layers(
+                current_input, 
+                KVCache::init_empty_list(self.layers.len())
+            );
+            total_aux_loss = total_aux_loss + routing_loss;
+            
+            gate = sigmoid(self.thinking_gate.forward(h_out.clone()));
+            current_input = x_emb.clone() + (h_out * gate.clone());
+        }
+
+        // Final Pass: Apply and update the actual KV caches
+        let (x_final, routing_loss_final, final_caches) = self.process_layers(current_input, active_caches);
+        total_aux_loss = total_aux_loss + routing_loss_final;
 
         let h_base = self.norm_f.forward(x_final);
         let logits = self.output.forward(h_base.clone());
@@ -50,22 +85,39 @@ impl<B: Backend> QuantCB<B> {
         let probe_logits = self.hallucination_probe.forward(h_base);
         let hallucination_probs = sigmoid(probe_logits);
 
-        (logits, hallucination_probs, gate)
+        (logits, hallucination_probs, gate, total_aux_loss, final_caches)
     }
 
-    /// Forward pass with Multi-Token Prediction and Thinking Gate
     pub fn forward_mtp(
         &self,
         input: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>) {
+        caches: Option<Vec<Option<KVCache<B>>>>
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>) {
         let x_emb = self.token_embedding.forward(input);
 
-        // Recurrent logic repeated for MTP branch consistency
-        let h_initial = self.process_layers(x_emb.clone());
-        let gate = sigmoid(self.thinking_gate.forward(h_initial.clone()));
-        let x_refined = x_emb + (h_initial * gate.clone());
-        let x_final = self.process_layers(x_refined);
+        let [batch_size, seq_len, _] = x_emb.dims();
+        let device = x_emb.device();
+
+        let mut current_input = x_emb.clone();
+        let mut gate = Tensor::<B, 3>::zeros([batch_size, seq_len, 1], &device);
+        let mut total_aux_loss = Tensor::<B, 1>::zeros([1], &device);
+
+        let active_caches = caches.unwrap_or_else(|| KVCache::init_empty_list(self.layers.len()));
+
+        for _ in 0..self.num_recurrent_steps {
+            let (h_out, routing_loss, _) = self.process_layers(
+                current_input, 
+                KVCache::init_empty_list(self.layers.len())
+            );
+            total_aux_loss = total_aux_loss + routing_loss;
+            
+            gate = sigmoid(self.thinking_gate.forward(h_out.clone()));
+            current_input = x_emb.clone() + (h_out * gate.clone());
+        }
+
+        let (x_final, routing_loss_final, final_caches) = self.process_layers(current_input, active_caches);
+        total_aux_loss = total_aux_loss + routing_loss_final;
 
         let h_base = self.norm_f.forward(x_final);
         let main_logits = self.output.forward(h_base.clone());
@@ -80,6 +132,6 @@ impl<B: Backend> QuantCB<B> {
             &self.output,
         );
 
-        (main_logits, mtp_logits, mtp_loss, hallucination_probs, gate)
+        (main_logits, mtp_logits, mtp_loss, hallucination_probs, gate, total_aux_loss, final_caches)
     }
 }

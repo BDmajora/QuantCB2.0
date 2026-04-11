@@ -46,25 +46,44 @@ impl<B: Backend> MoELayer<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 1>) {
         let [batch_size, seq_len, d_model] = x.dims();
         let device = x.device();
         
         let router_logits = self.router.forward(x.clone());
-        let weights = softmax(router_logits, 2); 
+        let routing_probs = softmax(router_logits, 2); 
         
-        let (top_k_weights, top_k_indices) = weights.topk_with_indices(self.top_k, 2);
+        let (top_k_weights, top_k_indices) = routing_probs.clone().topk_with_indices(self.top_k, 2);
         let top_k_weights = top_k_weights.clone() / top_k_weights.sum_dim(2);
 
         let mut final_output = Tensor::<B, 3>::zeros([batch_size, seq_len, d_model], &device);
+        let mut routing_loss = Tensor::<B, 1>::zeros([1], &device);
+        
+        let b_s_float = (batch_size * seq_len) as f32;
 
         for i in 0..self.experts.len() {
+            // Standard Expert Application
             let expert_mask = top_k_indices.clone().equal_elem(i as i32).float();
-            let combined_weight = (expert_mask * top_k_weights.clone()).sum_dim(2);
+            let combined_weight = (expert_mask.clone() * top_k_weights.clone()).sum_dim(2);
             let expert_output = self.experts[i].forward(x.clone());
             final_output = final_output + (expert_output * combined_weight);
+            
+            // --- Load Balancing Loss Calculation ---
+            // 1. Calculate f_i (Fraction of tokens routed to expert i)
+            let fraction_routed = expert_mask.sum() / b_s_float;
+            
+            // 2. Calculate P_i (Mean router probability for expert i)
+            let prob_i = routing_probs.clone()
+                .slice([0..batch_size, 0..seq_len, i..(i+1)])
+                .mean();
+                
+            routing_loss = routing_loss + (fraction_routed * prob_i);
         }
 
-        final_output
+        // Multiply by E (Number of Experts) and alpha (0.01)
+        let alpha = 0.01;
+        routing_loss = routing_loss * (self.experts.len() as f32 * alpha);
+
+        (final_output, routing_loss)
     }
 }

@@ -20,6 +20,7 @@ pub struct QuantCBConfig {
     pub d_c_q: usize,
     pub d_head_c: usize,
     pub d_rope: usize,
+    pub num_recurrent_steps: usize,
 }
 
 impl QuantCBConfig {
@@ -42,8 +43,6 @@ impl QuantCBConfig {
 
         let hallucination_probe = LinearConfig::new(self.d_model, 1).init(device);
 
-        // Initialize the Thinking Gate
-        // This projects the hidden state to a single value to control feedback
         let thinking_gate = LinearConfig::new(self.d_model, 1).init(device);
 
         QuantCB {
@@ -54,6 +53,7 @@ impl QuantCBConfig {
             mtp,
             hallucination_probe,
             thinking_gate,
+            num_recurrent_steps: self.num_recurrent_steps,
         }
     }
 }
