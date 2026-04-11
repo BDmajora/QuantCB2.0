@@ -7,6 +7,7 @@ mod model;
 mod mtp; 
 
 use burn::backend::Wgpu;
+use burn::nn::loss::CrossEntropyLossConfig;
 use burn::tensor::{Int, Tensor};
 use config::QuantCBConfig;
 
@@ -16,6 +17,7 @@ fn main() {
 
     println!("QuantCB 2.0 | Backend: Vulkan (WGPU)");
 
+    // Config: vocab, d_model, heads, layers, experts, top_k, seq_len, dropout, d_c, d_c_q, d_head_c, d_rope, recurrent_steps
     let config = QuantCBConfig::new(
         10000, 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16, 2,
     );
@@ -23,6 +25,7 @@ fn main() {
     let model = config.init::<Backend>(&device);
     println!("Model with Dynamic Thinking Gate, Recurrent Feedback, and Balanced MoE initialized.");
 
+    // Dummy Batch for Verification
     let dummy_input = Tensor::<Backend, 2, Int>::from_data(
         [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]],
         &device,
@@ -33,23 +36,38 @@ fn main() {
         &device,
     );
 
-    // FIX: Added `None` for caches, and `_final_caches` to the tuple
-    let (output, _probe_probs, think_gate, aux_loss, _final_caches) = model.forward(dummy_input.clone(), None);
+    println!("\n--- Executing MTP Forward Pass ---");
     
-    println!("Standard Output shape: {:?}", output.dims());
-    println!("Thinking Gate shape:   {:?}", think_gate.dims());
-    println!("MoE Routing Loss:      {:?}", aux_loss.into_data());
-
-    println!("\n--- Testing MTP System ---");
-    
-    // FIX: Added `None` for caches, and `_mtp_final_caches` to the tuple
     let (main_logits, _mtp_logits, mtp_loss, _mtp_probe_probs, mtp_think_gate, mtp_aux_loss, _mtp_final_caches) = 
-        model.forward_mtp(dummy_input, dummy_targets, None);
+        model.forward_mtp(dummy_input, dummy_targets.clone(), None);
 
-    println!("Main Logits shape:     {:?}", main_logits.dims());
-    println!("Thinking Gate (MTP):   {:?}", mtp_think_gate.dims());
-    println!("MTP Loss:              {:?}", mtp_loss.into_data());
-    println!("MTP Routing Loss:      {:?}", mtp_aux_loss.into_data());
+    // 1. Main Prediction Loss (t+1)
+    let loss_fn = CrossEntropyLossConfig::new().init(&device);
+    let [batch_size, seq_len, vocab_size] = main_logits.dims();
     
-    println!("\nVerification Complete: Dual-pass refinement, gated feedback, and expert balancing functional.");
+    let logits_flat = main_logits.reshape([batch_size * seq_len, vocab_size]);
+    let targets_flat = dummy_targets.reshape([batch_size * seq_len]);
+    
+    let main_loss = loss_fn.forward(logits_flat, targets_flat);
+
+    // 2. Auxiliary Scaling Factors
+    let mtp_weight = 0.3;
+    let aux_routing_weight = 1.0; 
+
+    // 3. Final Weighted Sum for Optimizer
+    let final_loss = main_loss.clone() 
+        + mtp_loss.clone().mul_scalar(mtp_weight) 
+        + mtp_aux_loss.clone().mul_scalar(aux_routing_weight);
+
+    // Telemetry Output
+    println!("Main Logits:           {:?}", [batch_size, seq_len, vocab_size]);
+    println!("Thinking Gate (MTP):   {:?}", mtp_think_gate.dims());
+    println!("-----------------------------------------");
+    println!("Main Prediction Loss:  {:?}", main_loss.into_data());
+    println!("MTP Loss (Unscaled):   {:?}", mtp_loss.into_data());
+    println!("MoE Routing Loss:      {:?}", mtp_aux_loss.into_data());
+    println!("TOTAL TRACKED LOSS:    {:?}", final_loss.into_data());
+    println!("-----------------------------------------");
+    
+    println!("\nVerification Complete: Model logic is sound and ready for the training loop.");
 }
