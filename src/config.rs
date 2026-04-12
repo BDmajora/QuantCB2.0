@@ -24,6 +24,12 @@ pub struct QuantCBConfig {
 }
 
 impl QuantCBConfig {
+    // --- LATE INITIALIZATION BUILDER ---
+    pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
+        self.vocab_size = vocab_size;
+        self
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> QuantCB<B> {
         let token_embedding = EmbeddingConfig::new(self.vocab_size, self.d_model).init(device);
         
@@ -42,7 +48,6 @@ impl QuantCBConfig {
         let mtp = mtp_config.init(device);
 
         let hallucination_probe = LinearConfig::new(self.d_model, 1).init(device);
-
         let thinking_gate = LinearConfig::new(self.d_model, 1).init(device);
 
         QuantCB {
@@ -53,7 +58,7 @@ impl QuantCBConfig {
             mtp,
             hallucination_probe,
             thinking_gate,
-            loop_depth: self.loop_depth, // Mapping to the new field name
+            loop_depth: self.loop_depth,
         }
     }
 }

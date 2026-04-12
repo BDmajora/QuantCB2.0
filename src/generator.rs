@@ -1,8 +1,8 @@
+// src/generator.rs
 use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, Int, ElementConversion}; 
+use burn::tensor::{Tensor, Int, ElementConversion};
 use crate::model::QuantCB;
 use crate::tokenizer::BPETokenizer;
-use crate::kv_cache::KVCache;
 
 pub struct TextGenerator;
 
@@ -12,46 +12,72 @@ impl TextGenerator {
         tokenizer: &BPETokenizer,
         device: &B::Device,
         prompt: &str,
-        max_len: usize,
+        max_tokens: usize,
+        temperature: f32,
+        rep_penalty: f32, 
     ) -> String {
         let mut tokens = tokenizer.encode(prompt);
-        let mut cache: Option<Vec<Option<KVCache<B>>>> = None;
+        
+        for _ in 0..max_tokens {
+            let context_len = tokens.len();
+            
+            // --- FIX 1: Convert usize tokens to Backend IntElem ---
+            let data_vec: Vec<B::IntElem> = tokens
+                .iter()
+                .map(|&t| (t as i64).elem()) // Convert usize -> i64 -> Backend Element
+                .collect();
 
-        for _ in 0..max_len {
-            // Incremental decoding: if cache exists, only process the last token
-            let input_tokens = if cache.is_some() {
-                let last = *tokens.last().unwrap_or(&0); 
-                vec![last]
-            } else {
-                tokens.clone()
-            };
+            let input_tensor = Tensor::<B, 1, Int>::from_data(
+                burn::tensor::Data::new(data_vec, [context_len].into()),
+                device,
+            ).unsqueeze::<2>(); // Shape: [1, seq_len]
 
-            // Create tensor from current token(s)
-            let input_tensor = Tensor::<B, 1, Int>::from_ints(
-                input_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>().as_slice(),
-                device
-            ).unsqueeze::<2>(); // [1, seq_len]
-
-            // Forward pass
-            let (logits, _, _, _, next_cache, _) = model.forward(input_tensor, cache);
-            cache = Some(next_cache);
-
+            // --- FIX 2: Dynamically size dummy targets to match input sequence length ---
+            // Using zeros() ensures valid vocab indices in case MTP calculates loss internally
+            let dummy: Tensor<B, 2, Int> = Tensor::zeros([1, context_len], device);
+            
+            // Forward pass using MTP logic
+            let (logits, _, _, _, _, _, _) = model.forward_mtp(input_tensor, dummy, None);
             let [_, seq_len, vocab_size] = logits.dims();
             
-            // Get the last logit
-            let last_token_logits = logits.slice([0..1, (seq_len - 1)..seq_len, 0..vocab_size]);
-            
-            // FIX: Convert to u32 first, then cast to usize
-            let next_token_id = last_token_logits
-                .argmax(2)
-                .into_data()
-                .value[0]
-                .elem::<u32>() as usize;
+            // Extract logits for the last token in the sequence
+            let last_logits_tensor = logits
+                .slice([0..1, (seq_len - 1)..seq_len, 0..vocab_size])
+                .reshape([vocab_size]);
+                
+            let mut last_logits = last_logits_tensor.into_data().value;
 
-            tokens.push(next_token_id);
+            // --- REPETITION PENALTY ---
+            let window_size = usize::min(context_len, 64);
+            for i in (context_len - window_size)..context_len {
+                let tok_idx = tokens[i] as usize;
+                if tok_idx < last_logits.len() {
+                    let val = last_logits[tok_idx].elem::<f32>();
+                    if val > 0.0 {
+                        last_logits[tok_idx] = B::FloatElem::from_elem(val / rep_penalty);
+                    } else {
+                        last_logits[tok_idx] = B::FloatElem::from_elem(val * rep_penalty);
+                    }
+                }
+            }
+
+            // --- TEMPERATURE & SAMPLING (Greedy w/ Temp) ---
+            let mut max_val = f32::NEG_INFINITY;
+            let mut next_token = 0;
             
-            // Optional check for end-of-text if your tokenizer defines it
-            // if Some(next_token_id) == tokenizer.special_tokens.get("<|endoftext|>").copied() { break; }
+            for (i, &logit) in last_logits.iter().enumerate() {
+                let adjusted_logit = logit.elem::<f32>() / f32::max(temperature, 0.01);
+                
+                if adjusted_logit > max_val {
+                    max_val = adjusted_logit;
+                    next_token = i;
+                }
+            }
+            
+            tokens.push(next_token);
+
+            // Optional: Stop early if an end-of-text token is generated
+            // if next_token == EOT_TOKEN_ID { break; }
         }
         
         tokenizer.decode(&tokens)

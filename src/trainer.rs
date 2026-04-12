@@ -1,8 +1,8 @@
-// src/trainer.rs
 use std::time::Instant;
 use burn::optim::{Optimizer, GradientsParams};
+use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::ElementConversion;
+use burn::tensor::ElementConversion; // Cleaned up unused Tensor/Int
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::backend::{Autodiff, Wgpu};
@@ -10,10 +10,11 @@ use burn::backend::{Autodiff, Wgpu};
 use crate::trainer_config::TrainingConfig; 
 use crate::model::QuantCB;
 use crate::batcher::{QuantCBBatch, QuantCBBatcher};
-use crate::tokenizer::BPETokenizer; // Updated Tokenizer
+use crate::tokenizer::BPETokenizer; 
 use crate::dataset::TextDataset;
-use crate::training_data::{TrainingDataSources, TAG_TRUTH, TAG_SHAKESPEARE};
+use crate::training_data::{TrainingDataSources, TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE};
 use crate::generator::TextGenerator; 
+// Removed unused KVCache import to clear warning
 
 pub struct QuantCBTrainer<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> {
     pub model: QuantCB<B>,
@@ -28,6 +29,8 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
     }
 
     pub fn train_step(&mut self, batch: QuantCBBatch<B>) -> f32 {
+        // FIX: Pass 'None' instead of 'vec![]'. 
+        // This tells the model we aren't using a KV Cache during training.
         let (main_logits, _, mtp_loss, _, _, aux_loss, _) = 
             self.model.forward_mtp(batch.inputs, batch.targets.clone(), None);
 
@@ -54,36 +57,18 @@ pub fn run() {
     type TrainBackend = Autodiff<Wgpu>; 
     let device: <TrainBackend as Backend>::Device = Default::default();
 
-    let raw_text = TrainingDataSources::load_tiny_shakespeare();
+    let initial_model_config = crate::config::QuantCBConfig::new(
+        0, 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16, 2,
+    );
     
-    // Initialize tokenizer with special tokens to bypass byte-splitting
-    let special_tags = vec![TAG_TRUTH, TAG_SHAKESPEARE];
+    let mut config = TrainingConfig::new(initial_model_config, burn::optim::AdamConfig::new());
+
+    let raw_text = TrainingDataSources::load_tiny_shakespeare(&config);
+    let special_tags = vec![TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE];
     let mut tokenizer = BPETokenizer::new(&special_tags);
     
-    // Train the BPE Tokenizer up to an arbitrary 2048 vocab size
-    println!("Training BPE Tokenizer...");
     tokenizer.train(&raw_text, 2048);
-
-    let model_config = crate::config::QuantCBConfig::new(
-        tokenizer.vocab_size(), 
-        256,                    
-        8,                      
-        4,                      
-        8,                      
-        2,                      
-        512,                    
-        0.1,                    
-        64,                     
-        64,                     
-        16,                     
-        16,                     
-        2,                      
-    );
-
-    let config = TrainingConfig::new(
-        model_config,
-        burn::optim::AdamConfig::new(),
-    );
+    config.model = config.model.with_vocab_size(tokenizer.vocab_size());
 
     let dataset = TextDataset::new(tokenizer.encode(&raw_text), config.seq_len);
     let batcher = QuantCBBatcher::<TrainBackend>::new(device.clone());
@@ -93,16 +78,13 @@ pub fn run() {
         .build(dataset);
 
     let mut model = config.model.init::<TrainBackend>(&device);
-    
     model.loop_depth = config.loop_depth;
 
-    let optimizer = config.optimizer.init();
-    let mut trainer = QuantCBTrainer::new(
-        model, 
-        optimizer, 
-        config.learning_rate, 
-        config.entropy_reg_weight
-    );
+    let optimizer = config.optimizer
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(config.clip_grad_norm as f32)))
+        .init();
+
+    let mut trainer = QuantCBTrainer::new(model, optimizer, config.learning_rate, config.entropy_reg_weight);
 
     println!("\n--- Launching LoopLM (Ouro) Training Pipeline ---");
     let mut t0 = Instant::now();
@@ -120,8 +102,9 @@ pub fn run() {
 
         if step > 0 && step % 100 == 0 {
             let prompt = format!("{} {} \nFirst Citizen:", TAG_TRUTH, TAG_SHAKESPEARE);
-            let generated = TextGenerator::generate(&trainer.model, &tokenizer, &device, &prompt, 60);
-            println!("\n[Sample at Step {}]\n>> {}\n", step, generated);
+            // Renamed 'gen' to 'output' to avoid reserved keyword error
+            let output = TextGenerator::generate(&trainer.model, &tokenizer, &device, &prompt, 60, 0.8, 1.2);
+            println!("\n[Sample at Step {}]\n>> {}\n", step, output);
         }
 
         step += 1;
