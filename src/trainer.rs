@@ -58,9 +58,7 @@ pub fn run() {
     let device: <TrainBackend as Backend>::Device = Default::default();
 
     let output_dir = "modeloutputs";
-    if let Err(e) = fs::create_dir_all(output_dir) {
-        eprintln!("Warning: Could not create directory {}: {}", output_dir, e);
-    }
+    fs::create_dir_all(output_dir).ok();
 
     let initial_model_config = crate::config::QuantCBConfig::new(
         0, 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16, 2,
@@ -68,7 +66,7 @@ pub fn run() {
     
     let mut config = TrainingConfig::new(initial_model_config, burn::optim::AdamConfig::new());
 
-    // FIXED: Swapped tiny_shakespeare for complete_shakespeare
+    println!("--- Loading Shakespeare Dataset ---");
     let raw_text = TrainingDataSources::load_complete_shakespeare(&config);
     
     let special_tags = vec![TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE];
@@ -77,7 +75,14 @@ pub fn run() {
     tokenizer.train(&raw_text, 16384);
     config.model = config.model.with_vocab_size(tokenizer.vocab_size());
 
-    let dataset = TextDataset::new(tokenizer.encode(&raw_text), config.seq_len);
+    println!("--- Encoding Dataset ---");
+    // FIX: Convert Vec<u32> to Vec<usize> for the dataset
+    let encoded_data = tokenizer.encode(&raw_text)
+        .into_iter()
+        .map(|id| id as usize)
+        .collect();
+        
+    let dataset = TextDataset::new(encoded_data, config.seq_len);
     let batcher = QuantCBBatcher::<TrainBackend>::new(device.clone());
     let dataloader = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
@@ -93,7 +98,7 @@ pub fn run() {
 
     let mut trainer = QuantCBTrainer::new(model, optimizer, config.learning_rate, config.entropy_reg_weight);
 
-    println!("\n--- Launching LoopLM (Ouro) Training Pipeline ---");
+    println!("\n--- Launching QuantCB 2.0 Training Pipeline ---");
     let mut t0 = Instant::now();
     let mut step = 0;
 
@@ -113,14 +118,9 @@ pub fn run() {
             println!("\n[Sample at Step {}]\n>> {}\n", step, output);
         }
 
-        // Periodic Checkpoint
         if step > 0 && step % 500 == 0 {
             let save_path = format!("{}/checkpoint", output_dir);
-            println!("--- Periodic Checkpoint: Saving to {} ---", save_path);
-            
             let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
-            
-            // FIXED: Removed third argument (&device)
             recorder
                 .record(trainer.model.clone().into_record(), save_path.into())
                 .expect("Failed to save periodic checkpoint");
@@ -130,11 +130,8 @@ pub fn run() {
         if step >= config.max_iterations { break; }
     }
 
-    println!("\nTraining complete. Saving final weights...");
     let final_path = format!("{}/final_model", output_dir);
     let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
-    
-    // FIXED: Removed third argument (&device)
     recorder
         .record(trainer.model.clone().into_record(), final_path.into())
         .expect("Failed to save final model");

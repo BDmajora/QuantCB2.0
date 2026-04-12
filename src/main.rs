@@ -9,10 +9,15 @@ mod mtp;
 mod trainer_config;
 mod trainer;
 mod training_data;
-mod tokenizer;
 mod dataset;
 mod batcher;
 mod generator;
+
+// Tokenizer Sub-modules
+mod bpe_types;
+mod bpe_trainer;
+mod bpe_encoder;
+mod tokenizer;
 
 fn main() {
     println!("QuantCB 2.0 | Backend: Vulkan (WGPU)");
