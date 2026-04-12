@@ -11,6 +11,10 @@ pub struct TrainingConfig {
     pub model: QuantCBConfig,
     pub optimizer: AdamConfig,
 
+    // --- TOKENIZER ---
+    #[config(default = 8192)]
+    pub tokenizer_vocab_size: usize,
+
     // --- MIXTURE OF EXPERTS ---
     #[config(default = 8)]
     pub num_experts: usize,
@@ -19,24 +23,34 @@ pub struct TrainingConfig {
     pub corruption_rate: f32, 
 
     // --- LOOPLM LATENT REASONING ---
-    #[config(default = 2)]
+    #[config(default = 3)]
     pub loop_depth: usize, 
     
     #[config(default = 0.05)]
     pub entropy_reg_weight: f32, 
 
+    // --- KIMI TEAM ATTNRES ---
+    #[config(default = true)]
+    pub use_attn_res: bool,
+    
+    #[config(default = 4)]
+    pub attn_res_heads: usize, 
+
+    // --- MULTI-TOKEN PREDICTION ---
+    #[config(default = 0.1)]
+    pub mtp_loss_weight: f32,
+
     // --- STABLE CORE HYPERPARAMETERS ---
     #[config(default = 3e-4)]
     pub learning_rate: f64,
     
-    // NEW: Matches Python's GRAD_CLIP for MoE stability
     #[config(default = 1.0)]
     pub clip_grad_norm: f64, 
     
-    #[config(default = 16)] 
+    #[config(default = 8)] 
     pub batch_size: usize,
 
-    #[config(default = 256)]
+    #[config(default = 128)]
     pub seq_len: usize,
     
     #[config(default = 20000)]

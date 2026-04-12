@@ -1,98 +1,121 @@
-use std::collections::VecDeque;
+use std::f32;
+
+pub struct SchedulerState {
+    pub lr: f64,
+    pub mtp_weight: f32,
+}
 
 pub struct DynamicScheduler {
     pub current_lr: f64,
+    pub current_mtp_weight: f32,
+    pub base_lr: f64,
     pub min_lr: f64,
-    pub max_lr: f64, // Now used for Recovery!
+    pub max_mtp_weight: f32,
+    pub wake_ups: u32,
     
-    window_size: usize,
-    loss_window: VecDeque<f32>,
-    prev_mean_loss: Option<f32>,
+    short_ema: f32,
+    long_ema: f32,
     
-    jitter_threshold: f32,
-    plateau_epsilon: f32,
-    decay_factor: f64,
+    cooldown: usize,
+    active_cooldown: usize,
+    steps_since_action: usize,
+    total_steps: usize,
     
-    patience: usize,
-    steps_since_update: usize,
+    // New: Explicit state for post-slap recovery
+    is_in_recovery: bool,
 }
 
 impl DynamicScheduler {
-    pub fn new(initial_lr: f64) -> Self {
+    pub fn new(initial_lr: f64, initial_mtp: f32) -> Self {
         Self {
             current_lr: initial_lr,
-            min_lr: 1e-6,          
-            max_lr: initial_lr * 1.5, // Ceiling for recovery
+            current_mtp_weight: initial_mtp,
+            base_lr: initial_lr,
+            min_lr: 1.0e-6,
+            max_mtp_weight: 0.50,
+            wake_ups: 0,
             
-            window_size: 50,       
-            loss_window: VecDeque::with_capacity(50),
-            prev_mean_loss: None,
+            short_ema: 0.0,
+            long_ema: 0.0,
             
-            jitter_threshold: 0.15, 
-            plateau_epsilon: 0.01,  
-            decay_factor: 0.5,      
-            
-            patience: 200,          
-            steps_since_update: 0,
+            cooldown: 50,
+            active_cooldown: 50,
+            steps_since_action: 0,
+            total_steps: 0,
+            is_in_recovery: false,
         }
     }
 
-    pub fn step(&mut self, loss: f32) -> f64 {
-        if self.loss_window.len() == self.window_size {
-            self.loss_window.pop_front();
-        }
-        self.loss_window.push_back(loss);
-        self.steps_since_update += 1;
+    pub fn step(&mut self, loss: f32) -> SchedulerState {
+        self.total_steps += 1;
+        self.steps_since_action += 1;
 
-        if self.loss_window.len() < self.window_size || self.steps_since_update < self.patience {
-            return self.current_lr;
+        // Check if we are in the 500-step post-slap grace period
+        if self.is_in_recovery {
+            if self.steps_since_action >= 500 {
+                self.is_in_recovery = false;
+                self.steps_since_action = 0;
+            }
+            return SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight };
         }
 
-        let window_len = self.loss_window.len() as f32;
-        let sum: f32 = self.loss_window.iter().sum();
-        let mean = sum / window_len;
-        
-        let variance: f32 = self.loss_window.iter()
-            .map(|&val| (val - mean).powi(2))
-            .sum::<f32>() / window_len;
+        // Initialize EMAs
+        if self.total_steps == 1 {
+            self.short_ema = loss;
+            self.long_ema = loss;
+            return SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight };
+        }
+
+        // Standard EMA update
+        let alpha_short = 2.0 / (15.0 + 1.0);
+        let alpha_long = 2.0 / (100.0 + 1.0);
+        self.short_ema = alpha_short * loss + (1.0 - alpha_short) * self.short_ema;
+        self.long_ema = alpha_long * loss + (1.0 - alpha_long) * self.long_ema;
+
+        if self.total_steps < 100 || self.steps_since_action < self.active_cooldown {
+            return SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight };
+        }
+
+        let trend_ratio = self.short_ema / self.long_ema;
+
+        if trend_ratio > 1.05 {
+            self.current_lr *= 0.5;
+            self.current_mtp_weight = (self.current_mtp_weight * 0.7).max(0.05);
+            self.steps_since_action = 0;
+            self.active_cooldown = self.cooldown;
             
-        let std_dev = variance.sqrt();
-        let mut lr_changed = false;
+            println!("Divergence Detected: Cutting LR to {:.2e} | Dropping MTP to {:.3}", self.current_lr, self.current_mtp_weight);
+        }
+        else if trend_ratio > 0.995 {
+            if self.current_lr <= self.min_lr * 1.1 {
+                self.wake_ups += 1;
+                self.current_lr = self.base_lr * (0.8_f64).powi(self.wake_ups as i32).max(5e-6);
+                self.current_mtp_weight = (0.15 + (self.wake_ups as f32 * 0.05)).min(self.max_mtp_weight);
+                
+                self.short_ema = loss;
+                self.long_ema = loss;
 
-        // 1. Stability Check (Jitter Sensor)
-        if std_dev > self.jitter_threshold {
-            println!(" [Scheduler] High Jitter (σ={:.4}). Decaying LR.", std_dev);
-            self.current_lr = (self.current_lr * self.decay_factor).max(self.min_lr);
-            lr_changed = true;
-        } 
-        // 2. Progress & Recovery Check
-        else if let Some(prev_mean) = self.prev_mean_loss {
-            if mean > prev_mean - self.plateau_epsilon {
-                println!(" [Scheduler] Plateau. Mean: {:.4} -> {:.4}. Decaying LR.", prev_mean, mean);
-                self.current_lr = (self.current_lr * 0.8).max(self.min_lr); 
-                lr_changed = true;
-            } 
-            // NEW: RECOVERY LOGIC
-            // If jitter is very low (1/3 of threshold) and we're under the max, nudge it up
-            else if std_dev < (self.jitter_threshold / 3.0) && self.current_lr < self.max_lr {
-                let old_lr = self.current_lr;
-                self.current_lr = (self.current_lr * 1.05).min(self.max_lr);
-                if (self.current_lr - old_lr).abs() > 1e-9 {
-                    println!(" [Scheduler] High Stability. Recovering LR: {:.2e}", self.current_lr);
-                    // We don't set lr_changed to true here because we don't want to 
-                    // flush the window for a tiny 5% nudge.
-                }
+                // Enter Recovery Mode
+                self.is_in_recovery = true;
+                self.steps_since_action = 0;
+
+                println!("WAKE UP SLAP #{}: Restarting LR to {:.2e} | MTP to {:.3} | Recovery mode active for 500 steps", 
+                    self.wake_ups, self.current_lr, self.current_mtp_weight);
+            } else {
+                self.current_lr *= 0.85;
+                self.current_mtp_weight = (self.current_mtp_weight * 0.9).max(0.05);
+                self.steps_since_action = 0;
+                self.active_cooldown = self.cooldown;
+
+                println!("Plateau Detected: Decaying LR to {:.2e} | Easing MTP to {:.3}", self.current_lr, self.current_mtp_weight);
             }
         }
-
-        if lr_changed {
-            self.steps_since_update = 0;
-            self.prev_mean_loss = None;
-            self.loss_window.clear(); 
-        } else if self.steps_since_update % self.window_size == 0 {
-            self.prev_mean_loss = Some(mean);
+        else if trend_ratio < 0.97 {
+            self.current_mtp_weight = (self.current_mtp_weight * 1.02).min(self.max_mtp_weight);
+            self.steps_since_action = 0;
+            self.active_cooldown = self.cooldown;
         }
 
-        self.current_lr
+        SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight }
     }
 }
