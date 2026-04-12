@@ -1,5 +1,5 @@
 use std::collections::{HashMap, BinaryHeap};
-use rayon::prelude::*;
+use rayon::prelude::*; // Rayon is back.
 use crate::bpe_types::{MergeCandidate, WordList};
 use crate::tokenizer::BPETokenizer;
 
@@ -10,8 +10,14 @@ impl BPETrainer {
         let current_base = 256 + tokenizer.special_tokens.len() as u32;
         if (target_vocab_size as u32) <= current_base { return; }
 
-        println!("--- Preparing Tokenizer Data Structures ---");
-        let words: HashMap<&str, usize> = text.par_split_whitespace()
+        println!("--- Preparing Tokenizer Data Structures (Parallel) ---");
+
+        // FIX: Combine split_inclusive with Rayon fold/reduce.
+        // We collect to a Vec first (fast pointer collection) then parallelize the hashing.
+        let words: HashMap<&str, usize> = text
+            .split_inclusive(char::is_whitespace)
+            .collect::<Vec<_>>() 
+            .into_par_iter()
             .fold(HashMap::new, |mut acc, word| {
                 *acc.entry(word).or_insert(0) += 1;
                 acc
@@ -24,6 +30,7 @@ impl BPETrainer {
         let mut pair_counts: HashMap<(u32, u32), i32> = HashMap::new();
         let mut word_structures: Vec<WordList> = Vec::new();
 
+        // Convert the parallel-processed map into linked-list structures
         for (word_str, freq) in words {
             let bytes: Vec<u32> = word_str.bytes().map(|b| b as u32).collect();
             let n = bytes.len();
@@ -67,6 +74,7 @@ impl BPETrainer {
             new_bytes.extend(&tokenizer.vocab[&p1]);
             tokenizer.vocab.insert(current_id, new_bytes);
 
+            // This part stays high-performance linked-list updates
             for word in &mut word_structures {
                 let mut i = 0;
                 while i < word.ids.len() {

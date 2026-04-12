@@ -27,11 +27,15 @@ impl BPEEncoder {
     }
 
     fn encode_chunk(tokenizer: &BPETokenizer, text: &str) -> Vec<u32> {
-        text.par_split_whitespace()
+        // FIX: Collect into a Vec first to keep spaces (via split_inclusive)
+        // while still leveraging Rayon's parallel iteration for the actual BPE merging logic.
+        let words: Vec<&str> = text.split_inclusive(char::is_whitespace).collect();
+
+        words.into_par_iter()
             .flat_map(|word| {
                 let mut ids: Vec<u32> = word.bytes().map(|b| b as u32).collect();
                 while ids.len() >= 2 {
-                    // FIX: Explicitly tell Rust what types live inside this Option
+                    // Explicitly typed for the compiler to avoid inference errors
                     let mut best_merge: Option<(u32, u32, u32)> = None; 
                     
                     for window in ids.windows(2) {
