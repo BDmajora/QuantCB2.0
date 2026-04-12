@@ -17,6 +17,8 @@ use crate::tokenizer::BPETokenizer;
 use crate::dataset::TextDataset;
 use crate::training_data::{TrainingDataSources, TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE};
 use crate::generator::TextGenerator; 
+// Import the new scheduler logic
+use crate::learning::DynamicScheduler;
 
 pub struct QuantCBTrainer<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> {
     pub model: QuantCB<B>,
@@ -47,6 +49,8 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         
         let grads = total_loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.model);
+        
+        // Use the current dynamically updated learning rate
         self.model = self.optimizer.step(self.lr, self.model.clone(), grads_params);
 
         total_loss.into_data().value[0].elem::<f32>()
@@ -76,7 +80,6 @@ pub fn run() {
     config.model = config.model.with_vocab_size(tokenizer.vocab_size());
 
     println!("--- Encoding Dataset ---");
-    // FIX: Convert Vec<u32> to Vec<usize> for the dataset
     let encoded_data = tokenizer.encode(&raw_text)
         .into_iter()
         .map(|id| id as usize)
@@ -96,28 +99,44 @@ pub fn run() {
         .with_grad_clipping(Some(GradientClippingConfig::Norm(config.clip_grad_norm as f32)))
         .init();
 
+    // Initialize Trainer and our new Dynamic Scheduler
     let mut trainer = QuantCBTrainer::new(model, optimizer, config.learning_rate, config.entropy_reg_weight);
+    let mut scheduler = DynamicScheduler::new(config.learning_rate);
 
     println!("\n--- Launching QuantCB 2.0 Training Pipeline ---");
+    println!("Dynamic LR Scheduler active. Monitoring jitter and plateaus.");
+    
     let mut t0 = Instant::now();
     let mut step = 0;
 
     for batch in dataloader.iter() {
+        // 1. Run the training step
         let loss = trainer.train_step(batch);
         
+        // 2. Feed the loss to the scheduler and update the trainer's learning rate
+        trainer.lr = scheduler.step(loss);
+        
+        // 3. Status updates
         if step > 0 && step % 10 == 0 {
             let dt = t0.elapsed().as_secs_f64();
             let tps = (config.batch_size * config.seq_len * 10) as f64 / f64::max(dt, 0.001);
-            println!("Step {:4} | Loss: {:.4} | TPS: {:.0}", step, loss, tps);
+            
+            // Added LR to the log to watch the "Thermostat" in action
+            println!(
+                "Step {:4} | Loss: {:.4} | LR: {:.2e} | TPS: {:.0}", 
+                step, loss, trainer.lr, tps
+            );
             t0 = Instant::now();
         }
 
+        // 4. Sampling
         if step > 0 && step % 100 == 0 {
             let prompt = format!("{} {} \nShylock:", TAG_TRUTH, TAG_SHAKESPEARE);
             let output = TextGenerator::generate(&trainer.model, &tokenizer, &device, &prompt, 60, 0.8, 1.2);
             println!("\n[Sample at Step {}]\n>> {}\n", step, output);
         }
 
+        // 5. Periodic Checkpointing
         if step > 0 && step % 500 == 0 {
             let save_path = format!("{}/checkpoint", output_dir);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
@@ -130,6 +149,7 @@ pub fn run() {
         if step >= config.max_iterations { break; }
     }
 
+    // 6. Final Save
     let final_path = format!("{}/final_model", output_dir);
     let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
     recorder

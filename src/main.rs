@@ -12,6 +12,7 @@ mod training_data;
 mod dataset;
 mod batcher;
 mod generator;
+mod learning;
 
 // Tokenizer Sub-modules
 mod bpe_types;
