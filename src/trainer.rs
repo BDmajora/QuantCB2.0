@@ -1,11 +1,14 @@
 use std::time::Instant;
+use std::fs; 
 use burn::optim::{Optimizer, GradientsParams};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::ElementConversion; // Cleaned up unused Tensor/Int
+use burn::tensor::ElementConversion; 
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::backend::{Autodiff, Wgpu};
+use burn::module::Module; 
+use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
 use crate::trainer_config::TrainingConfig; 
 use crate::model::QuantCB;
@@ -14,7 +17,6 @@ use crate::tokenizer::BPETokenizer;
 use crate::dataset::TextDataset;
 use crate::training_data::{TrainingDataSources, TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE};
 use crate::generator::TextGenerator; 
-// Removed unused KVCache import to clear warning
 
 pub struct QuantCBTrainer<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> {
     pub model: QuantCB<B>,
@@ -29,8 +31,6 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
     }
 
     pub fn train_step(&mut self, batch: QuantCBBatch<B>) -> f32 {
-        // FIX: Pass 'None' instead of 'vec![]'. 
-        // This tells the model we aren't using a KV Cache during training.
         let (main_logits, _, mtp_loss, _, _, aux_loss, _) = 
             self.model.forward_mtp(batch.inputs, batch.targets.clone(), None);
 
@@ -57,17 +57,24 @@ pub fn run() {
     type TrainBackend = Autodiff<Wgpu>; 
     let device: <TrainBackend as Backend>::Device = Default::default();
 
+    let output_dir = "modeloutputs";
+    if let Err(e) = fs::create_dir_all(output_dir) {
+        eprintln!("Warning: Could not create directory {}: {}", output_dir, e);
+    }
+
     let initial_model_config = crate::config::QuantCBConfig::new(
         0, 256, 8, 4, 8, 2, 512, 0.1, 64, 64, 16, 16, 2,
     );
     
     let mut config = TrainingConfig::new(initial_model_config, burn::optim::AdamConfig::new());
 
-    let raw_text = TrainingDataSources::load_tiny_shakespeare(&config);
+    // FIXED: Swapped tiny_shakespeare for complete_shakespeare
+    let raw_text = TrainingDataSources::load_complete_shakespeare(&config);
+    
     let special_tags = vec![TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE];
     let mut tokenizer = BPETokenizer::new(&special_tags);
     
-    tokenizer.train(&raw_text, 2048);
+    tokenizer.train(&raw_text, 16384);
     config.model = config.model.with_vocab_size(tokenizer.vocab_size());
 
     let dataset = TextDataset::new(tokenizer.encode(&raw_text), config.seq_len);
@@ -101,13 +108,36 @@ pub fn run() {
         }
 
         if step > 0 && step % 100 == 0 {
-            let prompt = format!("{} {} \nFirst Citizen:", TAG_TRUTH, TAG_SHAKESPEARE);
-            // Renamed 'gen' to 'output' to avoid reserved keyword error
+            let prompt = format!("{} {} \nShylock:", TAG_TRUTH, TAG_SHAKESPEARE);
             let output = TextGenerator::generate(&trainer.model, &tokenizer, &device, &prompt, 60, 0.8, 1.2);
             println!("\n[Sample at Step {}]\n>> {}\n", step, output);
+        }
+
+        // Periodic Checkpoint
+        if step > 0 && step % 500 == 0 {
+            let save_path = format!("{}/checkpoint", output_dir);
+            println!("--- Periodic Checkpoint: Saving to {} ---", save_path);
+            
+            let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
+            
+            // FIXED: Removed third argument (&device)
+            recorder
+                .record(trainer.model.clone().into_record(), save_path.into())
+                .expect("Failed to save periodic checkpoint");
         }
 
         step += 1;
         if step >= config.max_iterations { break; }
     }
+
+    println!("\nTraining complete. Saving final weights...");
+    let final_path = format!("{}/final_model", output_dir);
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
+    
+    // FIXED: Removed third argument (&device)
+    recorder
+        .record(trainer.model.clone().into_record(), final_path.into())
+        .expect("Failed to save final model");
+        
+    println!("Final weights saved to {}. Done!", output_dir);
 }
