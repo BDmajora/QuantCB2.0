@@ -5,6 +5,7 @@ use crate::config::QuantCBConfig;
 pub const TAG_TRUTH: &str = "<|truth|>";
 pub const TAG_HALLUCINATE: &str = "<|hallucinate|>";
 pub const TAG_SHAKESPEARE: &str = "<|shakespeare|>";
+pub const TAG_WIKI: &str = "<|wiki|>";
 
 #[derive(Config)]
 pub struct TrainingConfig {

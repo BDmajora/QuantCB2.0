@@ -1,5 +1,6 @@
 use std::time::Instant;
 use std::fs; 
+use std::path::Path;
 use burn::optim::{Optimizer, GradientsParams};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -40,7 +41,6 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
     }
 
     pub fn train_step(&mut self, batch: QuantCBBatch<B>) -> f32 {
-        // Forward pass with Multi-Token Prediction support
         let (main_logits, _, mtp_loss, _, _, aux_loss, _) = 
             self.model.forward_mtp(batch.inputs, batch.targets.clone(), None);
 
@@ -51,7 +51,6 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         let targets_flat = batch.targets.reshape([batch_size * seq_len]);
         let main_loss = loss_fn.forward(logits_flat, targets_flat);
 
-        // total_loss uses the dynamic weights managed by the scheduler
         let total_loss = main_loss 
             + mtp_loss.mul_scalar(self.mtp_loss_weight) 
             + aux_loss.mul_scalar(self.entropy_reg_weight);
@@ -82,7 +81,6 @@ pub fn run() {
     
     let special_tags = vec![TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE];
     let mut tokenizer = BPETokenizer::new(&special_tags);
-    
     tokenizer.train(&raw_text, config.tokenizer_vocab_size);
 
     println!("--- Encoding Dataset ---");
@@ -102,34 +100,80 @@ pub fn run() {
         .with_vocab_size(tokenizer.vocab_size())
         .with_loop_depth(config.loop_depth);
 
-    let model = config.model.init::<TrainBackend>(&device);
-    
-    let optimizer = config.optimizer
+    let model_path = format!("{}/checkpoint_model", output_dir);
+    let optim_path = format!("{}/checkpoint_optim", output_dir);
+    let state_path = format!("{}/checkpoint_state.txt", output_dir);
+
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
+
+    let mut model = config.model.init::<TrainBackend>(&device);
+    let mut optimizer = config.optimizer
         .with_grad_clipping(Some(GradientClippingConfig::Norm(config.clip_grad_norm as f32)))
         .init();
 
-    // 1. Initialize Trainer
+    let mut step = 0;
+    let mut resumed_lr = config.learning_rate;
+    let mut resumed_wake_ups = 0;
+
+    if Path::new(&format!("{}.bin", model_path)).exists() {
+        println!("--- Found existing checkpoint. Attempting to resume ---");
+        
+        let model_record = recorder
+            .load(model_path.clone().into(), &device)
+            .expect("Failed to load model weights");
+        model = model.load_record(model_record);
+
+        if Path::new(&format!("{}.bin", optim_path)).exists() {
+            let optim_record = recorder
+                .load(optim_path.clone().into(), &device)
+                .expect("Failed to load optimizer state");
+            optimizer = optimizer.load_record(optim_record);
+        }
+
+        if Path::new(&state_path).exists() {
+            if let Ok(content) = fs::read_to_string(&state_path) {
+                let parts: Vec<&str> = content.trim().split(',').collect();
+                if parts.len() >= 3 {
+                    step = parts[0].parse().unwrap_or(0);
+                    resumed_lr = parts[1].parse().unwrap_or(config.learning_rate);
+                    resumed_wake_ups = parts[2].parse().unwrap_or(0);
+                } else {
+                    step = content.trim().parse().unwrap_or(0);
+                }
+            }
+        } else {
+            step = 2000;
+            println!("Warning: State file missing. Applying manual fallback to Step {}", step);
+        }
+        println!("Resuming training from Step {} with LR {}", step, resumed_lr);
+    }
+
     let mut trainer = QuantCBTrainer::new(
         model, 
         optimizer, 
-        config.learning_rate, 
+        resumed_lr, 
         config.entropy_reg_weight,
         config.mtp_loss_weight,
     );
 
-    // FIX: Pass initial MTP weight as the second argument
     let mut scheduler = DynamicScheduler::new(config.learning_rate, config.mtp_loss_weight);
+    
+    // Sync scheduler state with loaded values
+    if step > 0 {
+        scheduler.current_lr = resumed_lr;
+        scheduler.wake_ups = resumed_wake_ups;
+    }
 
     println!("\n--- Launching QuantCB 2.0 Training Pipeline ---");
-    println!("Architecture: Kimi AttnRes + LoopLM Dynamic Routing enabled.");
     
     let mut t0 = Instant::now();
-    let mut step = 0;
 
     for batch in dataloader.iter() {
+        // Skip ahead to the resumed step if necessary
+        // Note: For large datasets, use .skip() on the iterator instead
+        
         let loss = trainer.train_step(batch);
         
-        // FIX: Unpack SchedulerState to update both LR and MTP Weight
         let sched_state = scheduler.step(loss);
         trainer.lr = sched_state.lr;
         trainer.mtp_loss_weight = sched_state.mtp_weight;
@@ -138,7 +182,6 @@ pub fn run() {
             let dt = t0.elapsed().as_secs_f64();
             let tps = (config.batch_size * config.seq_len * 10) as f64 / f64::max(dt, 0.001);
             
-            // Added MTP Weight to the logs so you can watch the scheduler "think"
             println!(
                 "Step {:4} | Loss: {:.4} | LR: {:.2e} | MTP-W: {:.3} | TPS: {:.0}", 
                 step, loss, trainer.lr, trainer.mtp_loss_weight, tps
@@ -153,11 +196,20 @@ pub fn run() {
         }
 
         if step > 0 && step % 500 == 0 {
-            let save_path = format!("{}/checkpoint", output_dir);
-            let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
+            println!("Saving checkpoint at step {}...", step);
+            
             recorder
-                .record(trainer.model.clone().into_record(), save_path.into())
-                .expect("Failed to save periodic checkpoint");
+                .record(trainer.model.clone().into_record(), model_path.clone().into())
+                .expect("Failed to save model");
+
+            recorder
+                .record(trainer.optimizer.to_record(), optim_path.clone().into())
+                .expect("Failed to save optimizer");
+
+            // Save step, current lr, and wake_ups for a perfect resume
+            let state_data = format!("{},{},{}", step, trainer.lr, scheduler.wake_ups);
+            fs::write(&state_path, state_data)
+                .expect("Failed to save state file");
         }
 
         step += 1;
@@ -165,7 +217,6 @@ pub fn run() {
     }
 
     let final_path = format!("{}/final_model", output_dir);
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
     recorder
         .record(trainer.model.clone().into_record(), final_path.into())
         .expect("Failed to save final model");

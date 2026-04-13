@@ -21,7 +21,6 @@ pub struct DynamicScheduler {
     steps_since_action: usize,
     total_steps: usize,
     
-    // New: Explicit state for post-slap recovery
     is_in_recovery: bool,
 }
 
@@ -31,7 +30,9 @@ impl DynamicScheduler {
             current_lr: initial_lr,
             current_mtp_weight: initial_mtp,
             base_lr: initial_lr,
-            min_lr: 1.0e-6,
+            // FIX: Raised min_lr to 1.1e-4. 
+            // If it drops below this, it's in the "dead zone" and needs a reset.
+            min_lr: 1.1e-4, 
             max_mtp_weight: 0.50,
             wake_ups: 0,
             
@@ -50,7 +51,6 @@ impl DynamicScheduler {
         self.total_steps += 1;
         self.steps_since_action += 1;
 
-        // Check if we are in the 500-step post-slap grace period
         if self.is_in_recovery {
             if self.steps_since_action >= 500 {
                 self.is_in_recovery = false;
@@ -59,14 +59,12 @@ impl DynamicScheduler {
             return SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight };
         }
 
-        // Initialize EMAs
         if self.total_steps == 1 {
             self.short_ema = loss;
             self.long_ema = loss;
             return SchedulerState { lr: self.current_lr, mtp_weight: self.current_mtp_weight };
         }
 
-        // Standard EMA update
         let alpha_short = 2.0 / (15.0 + 1.0);
         let alpha_long = 2.0 / (100.0 + 1.0);
         self.short_ema = alpha_short * loss + (1.0 - alpha_short) * self.short_ema;
@@ -80,30 +78,33 @@ impl DynamicScheduler {
 
         if trend_ratio > 1.05 {
             self.current_lr *= 0.5;
-            self.current_mtp_weight = (self.current_mtp_weight * 0.7).max(0.05);
+            // FIX: Don't let MTP drop below 0.10 during divergence
+            self.current_mtp_weight = (self.current_mtp_weight * 0.7).max(0.10); 
             self.steps_since_action = 0;
             self.active_cooldown = self.cooldown;
             
             println!("Divergence Detected: Cutting LR to {:.2e} | Dropping MTP to {:.3}", self.current_lr, self.current_mtp_weight);
         }
         else if trend_ratio > 0.995 {
-            if self.current_lr <= self.min_lr * 1.1 {
+            // FIX: If we are in the "Plateau" state and LR is getting too low, SLAP.
+            if self.current_lr <= self.min_lr {
                 self.wake_ups += 1;
-                self.current_lr = self.base_lr * (0.8_f64).powi(self.wake_ups as i32).max(5e-6);
-                self.current_mtp_weight = (0.15 + (self.wake_ups as f32 * 0.05)).min(self.max_mtp_weight);
+                // FIX: Reset directly to base_lr (3e-4) instead of decaying the reset value
+                self.current_lr = self.base_lr; 
+                // FIX: Reset MTP weight to a healthy 0.20+ during a slap
+                self.current_mtp_weight = (0.20 + (self.wake_ups as f32 * 0.05)).min(self.max_mtp_weight);
                 
                 self.short_ema = loss;
                 self.long_ema = loss;
-
-                // Enter Recovery Mode
                 self.is_in_recovery = true;
                 self.steps_since_action = 0;
 
-                println!("WAKE UP SLAP #{}: Restarting LR to {:.2e} | MTP to {:.3} | Recovery mode active for 500 steps", 
+                println!("WAKE UP SLAP #{}: Restarting LR to {:.2e} | MTP to {:.3} | Recovery active", 
                     self.wake_ups, self.current_lr, self.current_mtp_weight);
             } else {
                 self.current_lr *= 0.85;
-                self.current_mtp_weight = (self.current_mtp_weight * 0.9).max(0.05);
+                // FIX: Raised the MTP floor to 0.12. 0.05 is effectively "off" for the model.
+                self.current_mtp_weight = (self.current_mtp_weight * 0.9).max(0.12);
                 self.steps_since_action = 0;
                 self.active_cooldown = self.cooldown;
 
