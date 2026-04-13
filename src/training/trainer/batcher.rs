@@ -1,7 +1,7 @@
 // src/batcher.rs
 use burn::data::dataloader::batcher::Batcher;
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor, Data, Shape}; // Added Shape
+use burn::tensor::{Int, Tensor, Data, Shape};
 
 #[derive(Clone)]
 pub struct QuantCBBatcher<B: Backend> {

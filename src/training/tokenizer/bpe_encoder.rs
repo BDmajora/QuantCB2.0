@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use crate::tokenizer::BPETokenizer;
+use crate::training::tokenizer::tokenizer::BPETokenizer;
 
 pub struct BPEEncoder;
 

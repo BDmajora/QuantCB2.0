@@ -4,7 +4,7 @@ use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
-use crate::kv_cache::KVCache;
+use crate::model::kv_cache::KVCache;
 
 #[derive(Config, Debug)]
 pub struct MLAConfig {

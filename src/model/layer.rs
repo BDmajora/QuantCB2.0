@@ -3,10 +3,10 @@ use burn::nn::{RmsNorm, RmsNormConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
-use crate::config::QuantCBConfig;
-use crate::kv_cache::KVCache;
-use crate::mla::{MLAConfig, MultiHeadLatentAttention};
-use crate::moe::MoELayer;
+use crate::model::config::QuantCBConfig;
+use crate::model::kv_cache::KVCache;
+use crate::model::mla::{MLAConfig, MultiHeadLatentAttention};
+use crate::model::moe::MoELayer;
 
 #[derive(Module, Debug)]
 pub struct QuantCBLayer<B: Backend> {

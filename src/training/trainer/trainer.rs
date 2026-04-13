@@ -11,15 +11,15 @@ use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module; 
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
-use crate::trainer_config::{TrainingConfig, TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE}; 
-use crate::config::QuantCBConfig;
-use crate::model::QuantCB;
-use crate::batcher::{QuantCBBatch, QuantCBBatcher};
-use crate::tokenizer::BPETokenizer; 
-use crate::dataset::TextDataset;
-use crate::training_data::TrainingDataSources;
+use crate::training::trainer::trainer_config::{TrainingConfig, TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE}; 
+use crate::model::config::QuantCBConfig;
+use crate::model::model::QuantCB;
+use crate::training::trainer::batcher::{QuantCBBatch, QuantCBBatcher};
+use crate::training::tokenizer::tokenizer::BPETokenizer; 
+use crate::training::data::dataset::TextDataset;
+use crate::training::data::training_data::TrainingDataSources;
 use crate::generator::TextGenerator; 
-use crate::learning::DynamicScheduler;
+use crate::training::data::learning::DynamicScheduler;
 
 pub struct QuantCBTrainer<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> {
     pub model: QuantCB<B>,
@@ -68,7 +68,10 @@ pub fn run() {
     type TrainBackend = Autodiff<Wgpu>; 
     let device: <TrainBackend as Backend>::Device = Default::default();
 
-    let output_dir = "modeloutputs";
+    // ==========================================
+    // FIX: Anchor the output directory to the project root
+    // ==========================================
+    let output_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/modeloutputs");
     fs::create_dir_all(output_dir).ok();
 
     let mut config = TrainingConfig::new(
@@ -169,8 +172,6 @@ pub fn run() {
     let mut t0 = Instant::now();
 
     for batch in dataloader.iter() {
-        // Skip ahead to the resumed step if necessary
-        // Note: For large datasets, use .skip() on the iterator instead
         
         let loss = trainer.train_step(batch);
         

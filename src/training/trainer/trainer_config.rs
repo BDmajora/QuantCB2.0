@@ -1,6 +1,6 @@
 use burn::config::Config;
 use burn::optim::AdamConfig;
-use crate::config::QuantCBConfig;
+use crate::model::config::QuantCBConfig;
 
 pub const TAG_TRUTH: &str = "<|truth|>";
 pub const TAG_HALLUCINATE: &str = "<|hallucinate|>";

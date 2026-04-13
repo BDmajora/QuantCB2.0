@@ -4,10 +4,10 @@ use burn::tensor::activation::{sigmoid, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
 
-use crate::layer::QuantCBLayer;
-use crate::mtp::MultiTokenPrediction; 
-use crate::kv_cache::KVCache;
-use crate::config::QuantCBConfig;
+use crate::model::layer::QuantCBLayer;
+use crate::model::mtp::MultiTokenPrediction; 
+use crate::model::kv_cache::KVCache;
+use crate::model::config::QuantCBConfig;
 
 #[derive(Module, Debug)]
 pub struct AttnRes<B: Backend> {

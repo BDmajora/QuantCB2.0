@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use regex::Regex;
-use crate::bpe_trainer::BPETrainer;
-use crate::bpe_encoder::BPEEncoder;
+use crate::training::tokenizer::bpe_trainer::BPETrainer;
+use crate::training::tokenizer::bpe_encoder::BPEEncoder;
 
 pub struct BPETokenizer {
     pub merges: HashMap<(u32, u32), u32>,

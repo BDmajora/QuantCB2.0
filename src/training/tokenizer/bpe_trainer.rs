@@ -1,7 +1,7 @@
 use std::collections::{HashMap, BinaryHeap};
-use rayon::prelude::*; // Rayon is back.
-use crate::bpe_types::{MergeCandidate, WordList};
-use crate::tokenizer::BPETokenizer;
+use rayon::prelude::*;
+use crate::training::tokenizer::bpe_types::{MergeCandidate, WordList};
+use crate::training::tokenizer::tokenizer::BPETokenizer;
 
 pub struct BPETrainer;
 

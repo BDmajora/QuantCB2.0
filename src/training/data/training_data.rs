@@ -5,11 +5,11 @@ use std::path::Path;
 use reqwest::blocking::Client;
 use std::time::Duration;
 
-// 1. IMPORT the config and the tags from your config file
-use crate::trainer_config::TrainingConfig;
+// 1. UPDATED IMPORT: Pointing to the new location in the training module
+use crate::training::trainer_config::TrainingConfig;
 
-// 2. RE-EXPORT the tags so trainer.rs can still find them here
-pub use crate::trainer_config::{
+// 2. UPDATED RE-EXPORT: Ensuring trainer.rs can still find these tags
+pub use crate::training::trainer_config::{
     TAG_TRUTH, 
     TAG_HALLUCINATE, 
     TAG_SHAKESPEARE,
@@ -56,14 +56,12 @@ impl TrainingDataSources {
             raw_content
         };
 
-        // Pass to processing logic
         Self::process_text(text, config)
     }
 
     fn process_text(text: String, config: &TrainingConfig) -> String {
         let mut processing_text = text;
 
-        // 1. Clean up Project Gutenberg noise
         if let Some(start_idx) = processing_text.find("*** START OF THE PROJECT GUTENBERG EBOOK") {
             let remainder = &processing_text[start_idx..];
             let actual_start = remainder.find("\n").unwrap_or(0);
@@ -76,8 +74,6 @@ impl TrainingDataSources {
 
         let mut combined_raw_text = String::new();
         let mut rng = rand::thread_rng();
-
-        // 2. Chunking logic (Fixing the \n\n delimiter)
         let normalized_text = processing_text.replace("\r\n", "\n");
         
         for chunk in normalized_text.split("\n\n") {
@@ -104,8 +100,6 @@ impl TrainingDataSources {
     // WIKIPEDIA LOGIC (Streaming Disk-to-Disk)
     // ==========================================
     
-    /// Checks for cached Wikipedia data, streams and processes raw dump if missing.
-    /// Returns the PATH to the cache file (not the String content!) to prevent OOM.
     pub fn prepare_wikipedia(config: &TrainingConfig) -> String {
         let cache_dir = "data/cache";
         let raw_dir = "data/raw";
@@ -140,12 +134,9 @@ impl TrainingDataSources {
 
         for line in reader.lines() {
             if let Ok(content) = line {
-                // 1. Basic Cleaning
                 let clean_content = content.trim();
-                // Skip lines that are too short to provide useful context
                 if clean_content.len() < 100 { continue; }
 
-                // 2. Tagging Logic
                 let is_truth = rng.gen_bool(1.0 - config.corruption_rate as f64);
                 let quality_tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
                 
@@ -155,7 +146,6 @@ impl TrainingDataSources {
                     Self::corrupt_logic(clean_content)
                 };
 
-                // 3. Write directly to Cache
                 writeln!(output_file, "{} {} {}", quality_tag, TAG_WIKI, final_text)
                     .expect("Disk full or write failure");
 
