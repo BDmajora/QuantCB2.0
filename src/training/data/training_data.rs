@@ -1,70 +1,49 @@
+use reqwest::Client;
+use tokio::sync::mpsc;
+use serde_json::Value;
 use rand::Rng;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use reqwest::blocking::Client;
-use std::time::Duration;
 
-// 1. UPDATED IMPORT: Pointing to the new location in the training module
-use crate::training::trainer_config::TrainingConfig;
-
-// 2. UPDATED RE-EXPORT: Ensuring trainer.rs can still find these tags
-pub use crate::training::trainer_config::{
-    TAG_TRUTH, 
-    TAG_HALLUCINATE, 
-    TAG_SHAKESPEARE,
-    TAG_WIKI,
+use crate::training::trainer::trainer_config::{
+    TrainingConfig, TAG_TRUTH, TAG_HALLUCINATE, TAG_WIKI, TAG_SHAKESPEARE
 };
 
-pub struct TrainingDataSources;
+pub struct VolatileDataPipeline {
+    shakespeare_buffer: Vec<String>,
+    active_wiki_buffer: Vec<String>,
+    wiki_receiver: Option<mpsc::Receiver<Vec<String>>>,
+    corruption_rate: f32,
+}
 
-impl TrainingDataSources {
-    // ==========================================
-    // SHAKESPEARE LOGIC (In-Memory Processing)
-    // ==========================================
-    
-    pub fn load_complete_shakespeare(config: &TrainingConfig) -> String {
-        let cache_dir = "data/cache";
-        let cache_path = format!("{}/shakespeare.txt", cache_dir);
-        
-        if !Path::new(cache_dir).exists() {
-            fs::create_dir_all(cache_dir).expect("Failed to create cache directory");
+impl VolatileDataPipeline {
+    pub fn new() -> Self {
+        Self {
+            shakespeare_buffer: Vec::new(),
+            active_wiki_buffer: Vec::new(),
+            wiki_receiver: None,
+            corruption_rate: 0.0,
         }
-        
-        let text = if Path::new(&cache_path).exists() {
-            println!("--- Loading Shakespeare from: {} ---", cache_path);
-            fs::read_to_string(&cache_path).expect("Failed to read local cache file.")
-        } else {
-            println!("--- Cache not found. Downloading from Project Gutenberg ---");
-            
-            let client = Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-                .timeout(Duration::from_secs(120))
-                .build()
-                .unwrap();
-
-            let url = "https://www.gutenberg.org/cache/epub/100/pg100.txt";
-            
-            let response = client.get(url)
-                .send()
-                .and_then(|r| r.error_for_status()) 
-                .expect("Network failure: Project Gutenberg is currently unreachable.");
-            
-            let raw_content = response.text().expect("Failed to read response body.");
-
-            fs::write(&cache_path, &raw_content).expect("Failed to write to cache.");
-            raw_content
-        };
-
-        Self::process_text(text, config)
     }
 
-    fn process_text(text: String, config: &TrainingConfig) -> String {
-        let mut processing_text = text;
+    pub async fn load_shakespeare(&mut self, config: &TrainingConfig) -> String {
+        println!("--- Downloading Complete Works of Shakespeare to RAM ---");
+        let client = Client::builder()
+            .user_agent("QuantCB-Trainer/2.0")
+            .build()
+            .unwrap();
 
+        let raw_content = client.get("https://www.gutenberg.org/cache/epub/100/pg100.txt")
+            .send()
+            .await
+            .expect("Failed to fetch Shakespeare")
+            .text()
+            .await
+            .expect("Failed to read text");
+
+        let mut processing_text = raw_content.clone();
+        
         if let Some(start_idx) = processing_text.find("*** START OF THE PROJECT GUTENBERG EBOOK") {
             let remainder = &processing_text[start_idx..];
-            let actual_start = remainder.find("\n").unwrap_or(0);
+            let actual_start = remainder.find('\n').unwrap_or(0);
             processing_text = remainder[actual_start..].trim().to_string();
         }
         
@@ -72,97 +51,112 @@ impl TrainingDataSources {
             processing_text.truncate(end_idx);
         }
 
-        let mut combined_raw_text = String::new();
+        let normalized = processing_text.replace("\r\n", "\n");
         let mut rng = rand::thread_rng();
-        let normalized_text = processing_text.replace("\r\n", "\n");
-        
-        for chunk in normalized_text.split("\n\n") {
-            let clean_chunk = chunk.trim();
-            if clean_chunk.is_empty() || clean_chunk.len() < 50 { continue; }
-            
+
+        for chunk in normalized.split("\n\n") {
+            let clean = chunk.trim();
+            if clean.len() < 50 { continue; }
+
             let is_truth = rng.gen_bool(1.0 - config.corruption_rate as f64);
             let tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
-            
             let final_chunk = if is_truth {
-                clean_chunk.to_string()
+                clean.to_string()
             } else {
-                Self::corrupt_logic(clean_chunk)
+                Self::corrupt_logic(clean)
             };
-            
-            combined_raw_text.push_str(&format!("{} {} {}\n", tag, TAG_SHAKESPEARE, final_chunk));
+
+            self.shakespeare_buffer.push(format!("{} {} {}", tag, TAG_SHAKESPEARE, final_chunk));
         }
-        
-        println!("Finished processing {} bytes of the Bard.", combined_raw_text.len());
-        combined_raw_text
+
+        println!("Loaded {} Shakespeare chunks into RAM.", self.shakespeare_buffer.len());
+        raw_content
     }
 
-    // ==========================================
-    // WIKIPEDIA LOGIC (Streaming Disk-to-Disk)
-    // ==========================================
-    
-    pub fn prepare_wikipedia(config: &TrainingConfig) -> String {
-        let cache_dir = "data/cache";
-        let raw_dir = "data/raw";
-        let processed_path = format!("{}/wiki_processed.txt", cache_dir);
-        let raw_path = format!("{}/wikipedia_pre_2022.jsonl", raw_dir);
-
-        if !Path::new(cache_dir).exists() {
-            fs::create_dir_all(cache_dir).expect("Failed to create cache directory");
+    pub fn get_random_shakespeare(&self) -> String {
+        if self.shakespeare_buffer.is_empty() {
+            return "No Shakespeare data loaded.".to_string();
         }
-
-        if Path::new(&processed_path).exists() {
-            println!("--- Processed Wikipedia cache found at: {} ---", processed_path);
-            return processed_path; 
-        } else {
-            println!("--- No processed cache found. Processing raw Wikipedia dump... ---");
-            if !Path::new(&raw_path).exists() {
-                panic!("Raw Wikipedia dump not found at {}. Please download a pre-2022 dump first.", raw_path);
-            }
-            
-            Self::process_wikipedia_streaming(&raw_path, &processed_path, config);
-            processed_path
-        }
-    }
-
-    fn process_wikipedia_streaming(input_path: &str, output_path: &str, config: &TrainingConfig) {
-        let input_file = File::open(input_path).expect("Could not open raw wiki file");
-        let reader = BufReader::new(input_file);
-        let mut output_file = File::create(output_path).expect("Could not create wiki cache file");
-        
         let mut rng = rand::thread_rng();
-        let mut lines_processed = 0;
+        let idx = rng.gen_range(0..self.shakespeare_buffer.len());
+        self.shakespeare_buffer[idx].clone()
+    }
 
-        for line in reader.lines() {
-            if let Ok(content) = line {
-                let clean_content = content.trim();
-                if clean_content.len() < 100 { continue; }
+    pub async fn get_next_wiki_text(&mut self) -> String {
+        if self.active_wiki_buffer.is_empty() {
+            if let Some(rx) = self.wiki_receiver.as_mut() {
+                match rx.recv().await {
+                    Some(new_chunk) => {
+                        self.active_wiki_buffer = new_chunk;
+                    }
+                    None => {
+                        return self.get_random_shakespeare();
+                    }
+                }
+            } else {
+                return self.get_random_shakespeare();
+            }
+        }
 
-                let is_truth = rng.gen_bool(1.0 - config.corruption_rate as f64);
-                let quality_tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
-                
-                let final_text = if is_truth {
-                    clean_content.to_string()
-                } else {
-                    Self::corrupt_logic(clean_content)
+        self.active_wiki_buffer.pop().unwrap_or_else(|| self.get_random_shakespeare())
+    }
+
+    pub fn start_huggingface_chunker(&mut self, config: &TrainingConfig) {
+        self.corruption_rate = config.corruption_rate;
+        let (tx, rx) = mpsc::channel::<Vec<String>>(2);
+        self.wiki_receiver = Some(rx);
+
+        let c_rate = config.corruption_rate;
+
+        tokio::spawn(async move {
+            let client = Client::builder().user_agent("QuantCB-Trainer/2.0").build().unwrap();
+            
+            let chunk_urls = vec![
+                "https://huggingface.co/datasets/v_m_s/wikipedia_20231101_simple_jsonl/resolve/main/data.jsonl",
+            ];
+
+            for url in chunk_urls {
+                let mut backoff = 1;
+                let raw_text = loop {
+                    match client.get(url).send().await {
+                        Ok(res) => {
+                            if let Ok(text) = res.text().await { break text; }
+                        }
+                        Err(e) => {
+                            println!("Download failed: {}. Retrying in {}s", e, backoff);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(30);
+                        }
+                    }
                 };
 
-                writeln!(output_file, "{} {} {}", quality_tag, TAG_WIKI, final_text)
-                    .expect("Disk full or write failure");
+                let mut processed_chunk = Vec::new();
+                
+                {
+                    let mut rng = rand::thread_rng();
 
-                lines_processed += 1;
-                if lines_processed % 100_000 == 0 {
-                    println!("--- Cached {} Wikipedia articles ---", lines_processed);
-                }
+                    for line in raw_text.lines() {
+                        if let Ok(json) = serde_json::from_str::<Value>(line) {
+                            if let Some(text) = json["text"].as_str() {
+                                if text.len() < 100 { continue; }
+                                let is_truth = rng.gen_bool(1.0 - c_rate as f64);
+                                let tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
+                                let final_text = if is_truth {
+                                    text.to_string()
+                                } else {
+                                    Self::corrupt_logic(text)
+                                };
+                                processed_chunk.push(format!("{} {} {}", tag, TAG_WIKI, final_text));
+                            }
+                        }
+                    }
+                } 
+
+                if tx.send(processed_chunk).await.is_err() { break; }
             }
-        }
-        
-        println!("--- Finished Wikipedia Processing. Processed {} total items. ---", lines_processed);
+        });
     }
 
-    // ==========================================
-    // SHARED UTILITIES
-    // ==========================================
-    
     fn corrupt_logic(text: &str) -> String {
         let mut tokens: Vec<&str> = text.split_whitespace().collect();
         if tokens.len() < 5 { return text.to_string(); }
