@@ -47,14 +47,19 @@ pub struct TrainingConfig {
     // --- STABLE CORE HYPERPARAMETERS ---
     #[config(default = 3e-4)]
     pub learning_rate: f64,
+    
     #[config(default = 1.0)]
     pub clip_grad_norm: f64, 
+    
     #[config(default = 8)] 
     pub batch_size: usize,
+    
     #[config(default = 128)]
     pub seq_len: usize,
+   
     #[config(default = 20000)]
     pub max_iterations: usize,
+    
     #[config(default = 42)]
     pub seed: u64,
 }
