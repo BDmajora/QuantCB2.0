@@ -1,6 +1,7 @@
 use burn::config::Config;
 use burn::module::Module;
-use burn::nn::{Linear, LinearConfig};
+// Swapping standard Linear for our custom BitNet 1.58b implementation
+use crate::model::bitlinear::{BitLinear, BitLinearConfig}; 
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
@@ -22,19 +23,17 @@ pub struct MLAConfig {
 
 #[derive(Module, Debug)]
 pub struct MultiHeadLatentAttention<B: Backend> {
-    // Query Projections
-    w_dq: Linear<B>, // Down-project X -> c_q
-    w_uq: Linear<B>, // Up-project c_q -> Q_NOPE
-    w_qr: Linear<B>, // Project c_q -> Q_PE (RoPE queries)
+    // All projections converted to BitLinear for ternary weight support
+    w_dq: BitLinear<B>, // Down-project X -> c_q
+    w_uq: BitLinear<B>, // Up-project c_q -> Q_NOPE
+    w_qr: BitLinear<B>, // Project c_q -> Q_PE (RoPE queries)
 
-    // Key/Value Projections
-    w_dkv: Linear<B>, // Down-project X -> c_kv
-    w_uk: Linear<B>,  // Up-project c_kv -> K_NOPE
-    w_uv: Linear<B>,  // Up-project c_kv -> V_NOPE
-    w_kr: Linear<B>,  // Project X -> K_PE (RoPE keys)
+    w_dkv: BitLinear<B>, // Down-project X -> c_kv
+    w_uk: BitLinear<B>,  // Up-project c_kv -> K_NOPE
+    w_uv: BitLinear<B>,  // Up-project c_kv -> V_NOPE
+    w_kr: BitLinear<B>,  // Project X -> K_PE (RoPE keys)
 
-    // Output Projection
-    o_proj: Linear<B>,
+    o_proj: BitLinear<B>,
 
     n_heads: usize,
     d_head_c: usize,
@@ -47,16 +46,17 @@ impl MLAConfig {
         let rope_dim = self.n_heads * self.d_rope;
 
         MultiHeadLatentAttention {
-            w_dq: LinearConfig::new(self.d_model, self.d_c_q).init(device),
-            w_uq: LinearConfig::new(self.d_c_q, nope_dim).init(device),
-            w_qr: LinearConfig::new(self.d_c_q, rope_dim).init(device),
+            // Initializing with BitLinearConfig
+            w_dq: BitLinearConfig::new(self.d_model, self.d_c_q).init(device),
+            w_uq: BitLinearConfig::new(self.d_c_q, nope_dim).init(device),
+            w_qr: BitLinearConfig::new(self.d_c_q, rope_dim).init(device),
 
-            w_dkv: LinearConfig::new(self.d_model, self.d_c).init(device),
-            w_uk: LinearConfig::new(self.d_c, nope_dim).init(device),
-            w_uv: LinearConfig::new(self.d_c, nope_dim).init(device),
-            w_kr: LinearConfig::new(self.d_model, rope_dim).init(device),
+            w_dkv: BitLinearConfig::new(self.d_model, self.d_c).init(device),
+            w_uk: BitLinearConfig::new(self.d_c, nope_dim).init(device),
+            w_uv: BitLinearConfig::new(self.d_c, nope_dim).init(device),
+            w_kr: BitLinearConfig::new(self.d_model, rope_dim).init(device),
 
-            o_proj: LinearConfig::new(nope_dim, self.d_model).init(device),
+            o_proj: BitLinearConfig::new(nope_dim, self.d_model).init(device),
 
             n_heads: self.n_heads,
             d_head_c: self.d_head_c,
@@ -73,12 +73,12 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
     ) -> (Tensor<B, 3>, KVCache<B>) {
         let [batch_size, seq_len_q, _d_model] = x.dims();
 
-        // 1. Query Projections
+        // 1. Query Projections (Now Ternary)
         let c_q = self.w_dq.forward(x.clone());
         let q_nope = self.w_uq.forward(c_q.clone()); 
         let q_pe = self.w_qr.forward(c_q);           
 
-        // 2. Key/Value Projections
+        // 2. Key/Value Projections (Now Ternary)
         let c_kv = self.w_dkv.forward(x.clone());
         let k_nope_3d = self.w_uk.forward(c_kv.clone()); 
         let v_nope_3d = self.w_uv.forward(c_kv);         
@@ -88,7 +88,7 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
         let k_3d = Tensor::cat(vec![k_nope_3d, k_pe_3d], 2);
         let v_3d = v_nope_3d;
 
-        // 3. Update Memory Cache BEFORE reshaping to 4D
+        // 3. Update Memory Cache
         let (k_ctx_3d, v_ctx_3d, updated_cache) = KVCache::update(cache, k_3d, v_3d);
 
         // 4. Reshape for Multi-Head
@@ -101,7 +101,8 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
         let k_ctx = self.reshape_for_mha(k_ctx_3d, batch_size, seq_len_kv, self.d_head_c + self.d_rope);
         let v_ctx = self.reshape_for_mha(v_ctx_3d, batch_size, seq_len_kv, self.d_head_c);
 
-        // 5. Attention Math
+        // 5. Attention Math 
+        // Note: Even though weights are ternary, we maintain FP scaling for numerical stability
         let scale = 1.0 / ((self.d_head_c + self.d_rope) as f32).sqrt();
         
         let k_t = k_ctx.transpose(); 
@@ -113,7 +114,7 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
 
         let context = attn_probs.matmul(v_ctx); 
 
-        // 7. Output Projection
+        // 7. Output Projection (Ternary)
         let context_flat = context
             .swap_dims(1, 2)
             .reshape([batch_size, seq_len_q, self.n_heads * self.d_head_c]);
@@ -140,7 +141,6 @@ impl<B: Backend> MultiHeadLatentAttention<B> {
         seq_len_kv: usize
     ) -> Tensor<B, 4> {
         let device = scores.device();
-        
         let offset = seq_len_kv - seq_len_q;
 
         let mask = Tensor::arange(0..seq_len_q as i64, &device)

@@ -1,5 +1,7 @@
 use burn::module::Module;
-use burn::nn::{Embedding, RmsNorm, Linear, LinearConfig, LayerNorm, LayerNormConfig};
+// Swapping standard Linear for BitLinear
+use crate::model::bitlinear::{BitLinear, BitLinearConfig}; 
+use burn::nn::{Embedding, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::{sigmoid, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor};
@@ -11,20 +13,20 @@ use crate::model::config::QuantCBConfig;
 
 #[derive(Module, Debug)]
 pub struct AttnRes<B: Backend> {
-    pub q_proj: Linear<B>,
-    pub k_proj: Linear<B>,
-    pub v_proj: Linear<B>,
-    pub norm: LayerNorm<B>,
+    pub q_proj: BitLinear<B>,
+    pub k_proj: BitLinear<B>,
+    pub v_proj: BitLinear<B>,
+    pub norm: RmsNorm<B>, // Swapped to RmsNorm for BitNet consistency
     pub d_model: usize,
 }
 
 impl<B: Backend> AttnRes<B> {
     pub fn new(config: &QuantCBConfig, device: &B::Device) -> Self {
         Self {
-            q_proj: LinearConfig::new(config.d_model, config.d_model).init(device),
-            k_proj: LinearConfig::new(config.d_model, config.d_model).init(device),
-            v_proj: LinearConfig::new(config.d_model, config.d_model).init(device),
-            norm: LayerNormConfig::new(config.d_model).init(device),
+            q_proj: BitLinearConfig::new(config.d_model, config.d_model).init(device),
+            k_proj: BitLinearConfig::new(config.d_model, config.d_model).init(device),
+            v_proj: BitLinearConfig::new(config.d_model, config.d_model).init(device),
+            norm: RmsNormConfig::new(config.d_model).init(device),
             d_model: config.d_model,
         }
     }
@@ -37,8 +39,7 @@ impl<B: Backend> AttnRes<B> {
             return current_update;
         }
 
-        // OPTIMIZATION: Keep as 4D [Batch, Seq, Depth, D_model] instead of flattening.
-        // This prevents WGPU from seeing a massive artificial batch size of (batch * seq).
+        // Maintain the 4D optimization for WGPU efficiency
         let query = current_update.clone().reshape([batch_size, seq_len, 1, d_model]);
         
         let mut history_tensors = Vec::with_capacity(depth);
@@ -46,27 +47,19 @@ impl<B: Backend> AttnRes<B> {
             history_tensors.push(h.clone().reshape([batch_size, seq_len, 1, d_model]));
         }
         
-        // Concat along the new 'Depth' dimension (index 2)
         let memory = Tensor::cat(history_tensors, 2);
 
-        // Burn's Linear handles the trailing D_model dimension perfectly in 4D
         let q = self.q_proj.forward(query);
         let k = self.k_proj.forward(memory.clone());
         let v = self.v_proj.forward(memory);
 
         let scale = (self.d_model as f64).sqrt();
-        
-        // Swap the last two dims for key transpose: [B, S, D, Depth]
         let k_t = k.swap_dims(2, 3); 
         
-        // Attention scores: [B, S, 1, D] x [B, S, D, Depth] -> [B, S, 1, Depth]
         let scores = q.matmul(k_t).div_scalar(scale);
-        let weights = softmax(scores, 3); // Softmax over the Depth dimension
+        let weights = softmax(scores, 3); 
 
-        // Context: [B, S, 1, Depth] x [B, S, Depth, D] -> [B, S, 1, D]
         let context = weights.matmul(v);
-        
-        // Reshape back to 3D: [B, S, D]
         let context = context.reshape([batch_size, seq_len, d_model]);
 
         self.norm.forward(current_update + context)
@@ -80,10 +73,11 @@ pub struct QuantCB<B: Backend> {
     pub loop_block: QuantCBLayer<B>, 
     pub attn_res: AttnRes<B>,
     pub norm_f: RmsNorm<B>,
-    pub output: Linear<B>,
+    // This MUST be BitLinear to share with MTP
+    pub output: BitLinear<B>, 
     pub mtp: MultiTokenPrediction<B>, 
-    pub hallucination_probe: Linear<B>,
-    pub thinking_gate: Linear<B>, 
+    pub hallucination_probe: BitLinear<B>,
+    pub thinking_gate: BitLinear<B>, 
     pub loop_depth: usize, 
 }
 
@@ -123,34 +117,32 @@ impl<B: Backend> QuantCB<B> {
 
         let active_caches = caches.unwrap_or_else(|| KVCache::init_empty_list(self.layers.len()));
 
-        // --- LoopLM Iterative Latent Reasoning with AttnRes & Gating ---
+        // --- Ternary Iterative Latent Reasoning ---
         for _ in 0..self.loop_depth {
-            // 1. Generate current block update
             let (h_out, routing_loss, _) = self.loop_block.forward(current_input.clone(), None);
             total_aux_loss = total_aux_loss + routing_loss;
             
-            // 2. QUALITATIVE FILTER: AttnRes selects relevant history
             let h_refined = self.attn_res.forward(h_out, &history);
             history.push(h_refined.clone());
 
-            // 3. QUANTITATIVE FILTER: Thinking Gate decides "how much" to add
+            // Thinking gate is now a ternary projection
             gate = sigmoid(self.thinking_gate.forward(h_refined.clone()));
             
-            // 4. Entropy Regularization (LoopLM logic)
+            // Entropy Regularization
             let p_safe = gate.clone().clamp(1e-7, 1.0 - 1e-7);
             let one_minus_p_safe = p_safe.clone().neg().add_scalar(1.0);
             let gate_entropy = (p_safe.clone().mul(p_safe.log()).neg() + one_minus_p_safe.clone().mul(one_minus_p_safe.log()).neg()).mean(); 
             total_aux_loss = total_aux_loss + gate_entropy;
 
-            // 5. Gated Residual Connection
             current_input = x_emb.clone() + (h_refined * gate.clone());
         }
 
-        // Final exit pass through output layers
         let (x_final, routing_loss_final, final_caches) = self.process_layers(current_input, active_caches);
         total_aux_loss = total_aux_loss + routing_loss_final;
 
         let h_base = self.norm_f.forward(x_final);
+        
+        // Both heads are now BitLinear
         let logits = self.output.forward(h_base.clone());
         let probe_logits = self.hallucination_probe.forward(h_base.clone());
         let hallucination_probs = sigmoid(probe_logits);
@@ -167,11 +159,12 @@ impl<B: Backend> QuantCB<B> {
         let (main_logits, hallucination_probs, gate, total_aux_loss, final_caches, h_base) = 
             self.forward(input, caches);
 
+        // Shared head sharing (&self.output) now works because both are BitLinear
         let (mtp_logits, mtp_loss) = self.mtp.forward(
             h_base,
             targets,
             &self.token_embedding,
-            &self.output,
+            &self.output, 
         );
 
         (main_logits, mtp_logits, mtp_loss, hallucination_probs, gate, total_aux_loss, final_caches)

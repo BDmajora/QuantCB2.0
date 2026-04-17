@@ -18,14 +18,27 @@ pub struct QuantCBLayer<B: Backend> {
 
 impl<B: Backend> QuantCBLayer<B> {
     pub fn init(config: &QuantCBConfig, device: &B::Device) -> Self {
+        // MLA initialized with BitLinear projections (ternary)
         let mla_config = MLAConfig::new(
-            config.d_model, config.n_heads, config.d_c, 
-            config.d_c_q, config.d_head_c, config.d_rope,
+            config.d_model, 
+            config.n_heads, 
+            config.d_c, 
+            config.d_c_q, 
+            config.d_head_c, 
+            config.d_rope,
         );
 
         Self {
             mla: mla_config.init(device),
-            moe: MoELayer::init(config.d_model, config.n_experts, config.top_k, device),
+            // MoE initialized with BitLinear experts (ternary)
+            moe: MoELayer::init(
+                config.d_model, 
+                config.n_experts, 
+                config.top_k, 
+                device
+            ),
+            // RmsNorm is kept in higher precision (standard Burn implementation)
+            // to maintain numerical stability between ternary blocks.
             norm1: RmsNormConfig::new(config.d_model).init(device),
             norm2: RmsNormConfig::new(config.d_model).init(device),
         }
@@ -36,18 +49,28 @@ impl<B: Backend> QuantCBLayer<B> {
         x: Tensor<B, 3>, 
         cache: Option<KVCache<B>>
     ) -> (Tensor<B, 3>, Tensor<B, 1>, Option<KVCache<B>>) {
+        // --- Multi-Head Latent Attention Block ---
         let residual = x.clone();
-        let x = self.norm1.forward(x);
         
-        // Unpack the tuple from MLA and add the attention output to the residual
-        let (mla_out, new_cache) = self.mla.forward(x, cache);
+        // Normalize before the ternary projections
+        let x_norm = self.norm1.forward(x);
+        
+        let (mla_out, new_cache) = self.mla.forward(x_norm, cache);
+        
+        // Residual connection: FP32/16 + Ternary-Output
         let x = residual + mla_out;
 
+        // --- Mixture of Experts Block ---
         let residual = x.clone();
-        let x = self.norm2.forward(x);
         
-        let (moe_out, routing_loss) = self.moe.forward(x);
+        // Second normalization to stabilize the MoE router inputs
+        let x_norm = self.norm2.forward(x);
         
-        (residual + moe_out, routing_loss, Some(new_cache))
+        let (moe_out, routing_loss) = self.moe.forward(x_norm);
+        
+        // Final output for this layer
+        let out = residual + moe_out;
+
+        (out, routing_loss, Some(new_cache))
     }
 }

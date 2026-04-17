@@ -1,3 +1,4 @@
+pub mod bitlinear;
 pub mod config;
 pub mod kv_cache;
 pub mod layer;

@@ -1,6 +1,9 @@
 use burn::config::Config;
-use burn::nn::{EmbeddingConfig, RmsNormConfig, LinearConfig};
+use burn::nn::{EmbeddingConfig, RmsNormConfig};
 use burn::tensor::backend::Backend;
+
+// Import your custom BitLinearConfig
+use crate::model::bitlinear::BitLinearConfig;
 
 // Fixed imports to point to the new model subdirectory
 use crate::model::layer::QuantCBLayer;
@@ -63,9 +66,11 @@ impl QuantCBConfig {
         let loop_block = QuantCBLayer::init(self, device);
         let attn_res = AttnRes::new(self, device);
 
-        // 4. Output & Auxiliary Heads
+        // 4. Output & Auxiliary Heads (Now using BitLinearConfig)
         let norm_f = RmsNormConfig::new(self.d_model).init(device);
-        let output = LinearConfig::new(self.d_model, self.vocab_size).init(device);
+        
+        // Output head converted to Ternary
+        let output = BitLinearConfig::new(self.d_model, self.vocab_size).init(device);
 
         let mtp_config = MTPConfig {
             d_model: self.d_model,
@@ -74,8 +79,9 @@ impl QuantCBConfig {
         };
         let mtp = mtp_config.init(device);
 
-        let hallucination_probe = LinearConfig::new(self.d_model, 1).init(device);
-        let thinking_gate = LinearConfig::new(self.d_model, 1).init(device);
+        // Auxiliary probes converted to Ternary
+        let hallucination_probe = BitLinearConfig::new(self.d_model, 1).init(device);
+        let thinking_gate = BitLinearConfig::new(self.d_model, 1).init(device);
 
         // 5. Final Assembly
         QuantCB {
