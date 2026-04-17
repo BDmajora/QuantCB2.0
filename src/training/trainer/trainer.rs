@@ -1,11 +1,11 @@
 use std::time::Instant;
 use burn::optim::{Optimizer, AdamConfig};
-// FIXED: GradientClippingConfig lives in its own module, not inside optim
 use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::ElementConversion; // Retained for .elem()
 use burn::backend::{Autodiff, Wgpu};
 use burn::data::dataloader::batcher::Batcher; 
-use burn::module::AutodiffModule; // <-- ADDED: Required to unlock .valid()
+use burn::module::AutodiffModule; 
 use rand::Rng;
 
 // Internal Imports
@@ -43,14 +43,31 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
             self.model.forward_mtp(batch.inputs, batch.targets.clone(), None);
 
         let [batch_size, seq_len, vocab_size] = main_logits.dims();
-        let loss_fn = burn::nn::loss::CrossEntropyLossConfig::new().init(&main_logits.device());
+        let num_elements = (batch_size * seq_len) as f32;
         
-        let logits_flat = main_logits.reshape([batch_size * seq_len, vocab_size]);
+        // 1. BitNet Stabilization (Temperature Scaling)
+        // Divide logits by ~15.0 to prevent Softmax from overflowing to 75.0
+        // This compresses the exploded quantized variance back to normal f32 ranges.
+        let temperature = 15.0;
+        let stabilized_logits = main_logits.div_scalar(temperature);
+        
+        let loss_fn = burn::nn::loss::CrossEntropyLossConfig::new()
+            .init(&stabilized_logits.device());
+        
+        let logits_flat = stabilized_logits.reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = batch.targets.reshape([batch_size * seq_len]);
         
-        let total_loss = loss_fn.forward(logits_flat, targets_flat)
-            + mtp_loss.mul_scalar(self.mtp_loss_weight) 
-            + aux_loss.mul_scalar(self.entropy_reg_weight);
+        // Burn's CrossEntropy is Mean-reduced by default
+        let base_loss = loss_fn.forward(logits_flat, targets_flat);
+        
+        // 2. Auxiliary Losses
+        // These are raw sums from the MoE/MTP layers. We scale them down.
+        let normalized_mtp = mtp_loss.div_scalar(num_elements);
+        let normalized_aux = aux_loss.div_scalar(num_elements);
+
+        let total_loss = base_loss
+            + normalized_mtp.mul_scalar(self.mtp_loss_weight) 
+            + normalized_aux.mul_scalar(self.entropy_reg_weight);
         
         let grads = total_loss.backward();
         
@@ -60,7 +77,7 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
             burn::optim::GradientsParams::from_grads(grads, &self.model)
         );
         
-        burn::tensor::ElementConversion::elem::<f32>(total_loss.into_data().value[0])
+        total_loss.into_scalar().elem::<f32>()
     }
 }
 
@@ -68,7 +85,6 @@ pub async fn run() {
     type TrainBackend = Autodiff<Wgpu>; 
     let device: <TrainBackend as Backend>::Device = Default::default();
     
-    // Gradient clipping is essential for STE stability
     let optim_config = AdamConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)));
     
@@ -169,12 +185,7 @@ fn run_sample_block<B: AutodiffBackend>(
     let mode = SampleMode::get_for_step(step, 100);
     let prompt = mode.build_prompt(TAG_TRUTH);
     
-    // <-- ADDED: Unpack the model into its non-differentiable form for inference.
-    // Burn ensures that B::Device and B::InnerBackend::Device are the exact same type, 
-    // so we can safely pass the device reference forward.
     let valid_model = model.clone().valid();
-
-    // Pass the valid_model instead of the autodiff model
     let output = TextGenerator::generate(&valid_model, tokenizer, device, &prompt, 60, 0.8, 1.2);
     
     println!("\n[Step {} - {}]\n>> {}\n", step, mode.name, output);

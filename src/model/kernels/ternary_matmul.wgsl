@@ -40,5 +40,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    output[row * meta.d_out + col] = sum;
+    // FIX: Apply variance scaling to prevent logit explosion.
+    // Scales the output by 1.0 / sqrt(d_in)
+    let scale: f32 = 1.0 / sqrt(f32(meta.d_in));
+    
+    output[row * meta.d_out + col] = sum * scale;
 }

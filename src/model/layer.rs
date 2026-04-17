@@ -14,11 +14,12 @@ pub struct QuantCBLayer<B: Backend> {
     moe: MoELayer<B>,
     norm1: RmsNorm<B>,
     norm2: RmsNorm<B>,
+    // The "stabilizer" scale factor
+    residual_scale: f32,
 }
 
 impl<B: Backend> QuantCBLayer<B> {
     pub fn init(config: &QuantCBConfig, device: &B::Device) -> Self {
-        // MLA initialized with BitLinear projections (ternary)
         let mla_config = MLAConfig::new(
             config.d_model, 
             config.n_heads, 
@@ -28,19 +29,22 @@ impl<B: Backend> QuantCBLayer<B> {
             config.d_rope,
         );
 
+        // STABILIZATION LOGIC:
+        // We scale the contribution of each ternary block by 1/sqrt(depth).
+        // If your loop_depth is 3, this is ~0.57. If it's 12, it's ~0.28.
+        let scale = 1.0 / (config.loop_depth as f32).sqrt().max(1.0);
+
         Self {
             mla: mla_config.init(device),
-            // MoE initialized with BitLinear experts (ternary)
             moe: MoELayer::init(
                 config.d_model, 
                 config.n_experts, 
                 config.top_k, 
                 device
             ),
-            // RmsNorm is kept in higher precision (standard Burn implementation)
-            // to maintain numerical stability between ternary blocks.
             norm1: RmsNormConfig::new(config.d_model).init(device),
             norm2: RmsNormConfig::new(config.d_model).init(device),
+            residual_scale: scale,
         }
     }
 
@@ -52,24 +56,26 @@ impl<B: Backend> QuantCBLayer<B> {
         // --- Multi-Head Latent Attention Block ---
         let residual = x.clone();
         
-        // Normalize before the ternary projections
+        // 1. Pre-Norm (crucial for ternary stability)
         let x_norm = self.norm1.forward(x);
         
         let (mla_out, new_cache) = self.mla.forward(x_norm, cache);
         
-        // Residual connection: FP32/16 + Ternary-Output
-        let x = residual + mla_out;
+        // 2. Scaled Residual Addition
+        // This prevents the ternary MLA from exploding the hidden state variance
+        let x = residual + mla_out.mul_scalar(self.residual_scale);
 
         // --- Mixture of Experts Block ---
         let residual = x.clone();
         
-        // Second normalization to stabilize the MoE router inputs
+        // 3. Pre-Norm for MoE
         let x_norm = self.norm2.forward(x);
         
         let (moe_out, routing_loss) = self.moe.forward(x_norm);
         
-        // Final output for this layer
-        let out = residual + moe_out;
+        // 4. Scaled Residual Addition
+        // This keeps the hidden state range consistent for the next layer (or the output head)
+        let out = residual + moe_out.mul_scalar(self.residual_scale);
 
         (out, routing_loss, Some(new_cache))
     }
