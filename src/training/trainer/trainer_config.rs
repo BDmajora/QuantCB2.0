@@ -12,11 +12,19 @@ pub struct TrainingConfig {
     pub model: QuantCBConfig,
     pub optimizer: AdamConfig,
 
-    // --- BITNET 1.58-BIT CORE ---
+    // --- BITNET 1.58-BIT CORE & STABILIZATION ---
     #[config(default = 8)]
     pub activation_bits: usize, // BitNet b1.58 usually uses 8-bit activations
     #[config(default = 1e-5)]
     pub quant_eps: f32,
+    
+    /// The starting temperature for logit scaling (Early training gradient flow)
+    #[config(default = 8.0)]
+    pub min_temp: f32,
+    
+    /// The target temperature for logit scaling (Late training BitNet stability)
+    #[config(default = 15.0)]
+    pub max_temp: f32,
 
     // --- TOKENIZER ---
     #[config(default = 8192)]
@@ -29,7 +37,7 @@ pub struct TrainingConfig {
     pub corruption_rate: f32, 
 
     // --- LOOPLM LATENT REASONING ---
-    #[config(default = 3)]
+    #[config(default = 2)]
     pub loop_depth: usize, 
     #[config(default = 0.05)]
     pub entropy_reg_weight: f32, 
@@ -45,16 +53,16 @@ pub struct TrainingConfig {
     pub mtp_loss_weight: f32,
 
     // --- STABLE CORE HYPERPARAMETERS ---
-    #[config(default = 3e-4)]
+    #[config(default = 8e-4)]
     pub learning_rate: f64,
     
     #[config(default = 1.0)]
     pub clip_grad_norm: f64, 
     
-    #[config(default = 8)] 
+    #[config(default = 16)] 
     pub batch_size: usize,
     
-    #[config(default = 128)]
+    #[config(default = 512)]
     pub seq_len: usize,
    
     #[config(default = 20000)]

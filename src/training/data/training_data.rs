@@ -103,7 +103,8 @@ impl VolatileDataPipeline {
 
     pub fn start_huggingface_chunker(&mut self, config: &TrainingConfig) {
         self.corruption_rate = config.corruption_rate;
-        let (tx, rx) = mpsc::channel::<Vec<String>>(2);
+        // Fix 3.1: Increase channel buffer from 2 to 8
+        let (tx, rx) = mpsc::channel::<Vec<String>>(8);
         self.wiki_receiver = Some(rx);
 
         let c_rate = config.corruption_rate;
@@ -113,46 +114,53 @@ impl VolatileDataPipeline {
             
             let chunk_urls = vec![
                 "https://huggingface.co/datasets/v_m_s/wikipedia_20231101_simple_jsonl/resolve/main/data.jsonl",
+                // Add more shards here if available, or loop the same URL
             ];
 
-            for url in chunk_urls {
-                let mut backoff = 1;
-                let raw_text = loop {
-                    match client.get(url).send().await {
-                        Ok(res) => {
-                            if let Ok(text) = res.text().await { break text; }
-                        }
-                        Err(e) => {
-                            println!("Download failed: {}. Retrying in {}s", e, backoff);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
-                            backoff = (backoff * 2).min(30);
-                        }
-                    }
-                };
-
-                let mut processed_chunk = Vec::new();
-                
-                {
-                    let mut rng = rand::thread_rng();
-
-                    for line in raw_text.lines() {
-                        if let Ok(json) = serde_json::from_str::<Value>(line) {
-                            if let Some(text) = json["text"].as_str() {
-                                if text.len() < 100 { continue; }
-                                let is_truth = rng.gen_bool(1.0 - c_rate as f64);
-                                let tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
-                                let final_text = if is_truth {
-                                    text.to_string()
-                                } else {
-                                    Self::corrupt_logic(text)
-                                };
-                                processed_chunk.push(format!("{} {} {}", tag, TAG_WIKI, final_text));
+            // Fix 3.2: Wrap the URL iteration in an infinite loop so it cycles
+            loop {
+                for url in &chunk_urls {
+                    let mut backoff = 1;
+                    let raw_text = loop {
+                        match client.get(*url).send().await {
+                            Ok(res) => {
+                                if let Ok(text) = res.text().await { break text; }
+                            }
+                            Err(e) => {
+                                println!("Download failed: {}. Retrying in {}s", e, backoff);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                                backoff = (backoff * 2).min(30);
                             }
                         }
-                    }
-                } 
+                    };
 
-                if tx.send(processed_chunk).await.is_err() { break; }
+                    let mut processed_chunk = Vec::new();
+                    
+                    {
+                        let mut rng = rand::thread_rng();
+
+                        for line in raw_text.lines() {
+                            if let Ok(json) = serde_json::from_str::<Value>(line) {
+                                if let Some(text) = json["text"].as_str() {
+                                    if text.len() < 100 { continue; }
+                                    let is_truth = rng.gen_bool(1.0 - c_rate as f64);
+                                    let tag = if is_truth { TAG_TRUTH } else { TAG_HALLUCINATE };
+                                    let final_text = if is_truth {
+                                        text.to_string()
+                                    } else {
+                                        Self::corrupt_logic(text)
+                                    };
+                                    processed_chunk.push(format!("{} {} {}", tag, TAG_WIKI, final_text));
+                                }
+                            }
+                        }
+                    } 
+
+                    // Return completely out of the spawned task if the receiver is dropped
+                    if tx.send(processed_chunk).await.is_err() { 
+                        return; 
+                    }
+                }
             }
         });
     }

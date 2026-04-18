@@ -2,7 +2,7 @@ use std::time::Instant;
 use burn::optim::{Optimizer, AdamConfig};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::ElementConversion; // Retained for .elem()
+use burn::tensor::ElementConversion; 
 use burn::backend::{Autodiff, Wgpu};
 use burn::data::dataloader::batcher::Batcher; 
 use burn::module::AutodiffModule; 
@@ -38,17 +38,23 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         Self { model, optimizer, lr, entropy_reg_weight, mtp_loss_weight }
     }
 
-    pub fn train_step(&mut self, batch: QuantCBBatch<B>) -> f32 {
+    // FIX: Added temperature parameter to support dynamic scaling from learning.rs
+    pub fn train_step(
+        &mut self, 
+        batch: QuantCBBatch<B>, 
+        current_loop_depth: usize, 
+        temperature: f32
+    ) -> f32 {
+        // Pass current_loop_depth into forward_mtp
         let (main_logits, _, mtp_loss, _, _, aux_loss, _) = 
-            self.model.forward_mtp(batch.inputs, batch.targets.clone(), None);
+            self.model.forward_mtp(batch.inputs, batch.targets.clone(), None, current_loop_depth);
 
         let [batch_size, seq_len, vocab_size] = main_logits.dims();
         let num_elements = (batch_size * seq_len) as f32;
         
-        // 1. BitNet Stabilization (Temperature Scaling)
-        // Divide logits by ~15.0 to prevent Softmax from overflowing to 75.0
-        // This compresses the exploded quantized variance back to normal f32 ranges.
-        let temperature = 15.0;
+        // 1. BitNet Stabilization (Dynamic Temperature Scaling)
+        // Instead of hardcoded 15.0, we use the value provided by the scheduler to 
+        // manage gradient flow during early vs late training.
         let stabilized_logits = main_logits.div_scalar(temperature);
         
         let loss_fn = burn::nn::loss::CrossEntropyLossConfig::new()
@@ -57,11 +63,9 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         let logits_flat = stabilized_logits.reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = batch.targets.reshape([batch_size * seq_len]);
         
-        // Burn's CrossEntropy is Mean-reduced by default
         let base_loss = loss_fn.forward(logits_flat, targets_flat);
         
         // 2. Auxiliary Losses
-        // These are raw sums from the MoE/MTP layers. We scale them down.
         let normalized_mtp = mtp_loss.div_scalar(num_elements);
         let normalized_aux = aux_loss.div_scalar(num_elements);
 
@@ -111,7 +115,7 @@ pub async fn run() {
         resumed_mtp
     );
     
-    let mut scheduler = DynamicScheduler::new(config.learning_rate, config.mtp_loss_weight);
+    let mut scheduler = DynamicScheduler::new(config.learning_rate, config.mtp_loss_weight, config.model.loop_depth);
     if step > 0 { 
         scheduler.current_lr = resumed_lr; 
         scheduler.current_mtp_weight = resumed_mtp;
@@ -124,6 +128,10 @@ pub async fn run() {
     
     pipeline.start_huggingface_chunker(&config);
     let mut t0 = Instant::now();
+
+    // Initialize trackers for dynamic values
+    let mut current_loop_depth = 1;
+    let mut current_temp = config.min_temp; // Start at lower temp for higher gradient flow
 
     println!("\n--- Launching QuantCB 2.0 Optimized Loop ---");
 
@@ -139,19 +147,28 @@ pub async fn run() {
         streamer.push(tokenizer.encode(&text).into_iter().map(|id| id as usize).collect());
 
         if let Some(batch_items) = streamer.get_next_batch() {
-            let loss = trainer.train_step(batcher.batch(batch_items));
-            let state = scheduler.step(loss);
+            // FIX: Pass current_temp along with depth to the train step
+            let loss = trainer.train_step(
+                batcher.batch(batch_items), 
+                current_loop_depth, 
+                current_temp
+            );
             
+            // Update scheduler and capture all dynamically adjusted states
+            let state = scheduler.step(loss);
             trainer.lr = state.lr;
             trainer.mtp_loss_weight = state.mtp_weight;
+            current_loop_depth = state.loop_depth;
+            current_temp = state.temperature; // Capture dynamic temperature
             
             if step % 10 == 0 {
                 let elapsed = t0.elapsed().as_secs_f64().max(0.001);
                 let tps = (config.batch_size * config.seq_len * 10) as f64 / elapsed;
                 
+                // Track 'Temp' and 'Depth' in console output
                 println!(
-                    "Step {:4} | Loss: {:.4} | LR: {:.2e} | MTP: {:.3} | Wakes: {} | TPS: {:.0}", 
-                    step, loss, trainer.lr, trainer.mtp_loss_weight, scheduler.wake_ups, tps
+                    "Step {:4} | Loss: {:.4} | LR: {:.2e} | Temp: {:.1} | Depth: {} | MTP: {:.3} | Wakes: {} | TPS: {:.0}", 
+                    step, loss, trainer.lr, current_temp, current_loop_depth, trainer.mtp_loss_weight, scheduler.wake_ups, tps
                 );
                 t0 = Instant::now();
             }
@@ -186,6 +203,7 @@ fn run_sample_block<B: AutodiffBackend>(
     let prompt = mode.build_prompt(TAG_TRUTH);
     
     let valid_model = model.clone().valid();
+    // During sample generation, we use the standard model loop_depth for "thinking"
     let output = TextGenerator::generate(&valid_model, tokenizer, device, &prompt, 60, 0.8, 1.2);
     
     println!("\n[Step {} - {}]\n>> {}\n", step, mode.name, output);

@@ -15,9 +15,6 @@ impl TextGenerator {
         temperature: f32,
         rep_penalty: f32, 
     ) -> String {
-        // NOTE: model.valid() has been removed from here! 
-        // B is now assumed to already be the inner (inference) backend.
-        
         let mut tokens = tokenizer.encode(prompt); 
         let vocab_size_actual = tokenizer.vocab_size();
         
@@ -35,11 +32,16 @@ impl TextGenerator {
                 device,
             ); 
 
-            // Dummy targets for MTP 
+            // Dummy targets for MTP (required by the signature, though not used for loss here)
             let dummy: Tensor<B, 2, Int> = Tensor::zeros([1, context_len], device);
             
-            // Model Forward
-            let (logits, _, _, _, _, _, _) = model.forward_mtp(input_tensor, dummy, None);
+            // FIX: Pass model.loop_depth as the 4th argument to satisfy the new signature
+            let (logits, _, _, _, _, _, _) = model.forward_mtp(
+                input_tensor, 
+                dummy, 
+                None, 
+                model.loop_depth
+            );
             
             // Fix E0282: Explicitly type the dims array
             let [batch, seq_len, vocab_size]: [usize; 3] = logits.dims();
@@ -47,7 +49,6 @@ impl TextGenerator {
                 .slice([0..batch, (seq_len - 1)..seq_len, 0..vocab_size])
                 .reshape([vocab_size]);
                 
-            // Fix E0282: Convert tensor directly to standard Vec<f32> upfront
             let mut last_logits: Vec<f32> = last_logits_tensor.into_data().convert::<f32>().value;
 
             // --- Bit-Stable Repetition Penalty ---
@@ -57,8 +58,7 @@ impl TextGenerator {
             for &prev_token in recent_tokens {
                 let idx = prev_token as usize;
                 if idx < last_logits.len() {
-                    let val = last_logits[idx]; // No longer needs .elem()
-                    // Apply penalty: shrink positive logits, amplify negative ones
+                    let val = last_logits[idx]; 
                     if val > 0.0 {
                         last_logits[idx] = val / rep_penalty;
                     } else {
@@ -73,7 +73,6 @@ impl TextGenerator {
             let temp = f32::max(temperature, 0.01);
             
             for (i, &logit) in last_logits.iter().enumerate() {
-                // logit is now standard f32, no need for .elem()
                 let adjusted = logit / temp; 
                 
                 if adjusted > max_val {
@@ -82,7 +81,6 @@ impl TextGenerator {
                 }
             }
             
-            // Safety check against vocab overflow
             if next_token >= vocab_size_actual {
                 break;
             }

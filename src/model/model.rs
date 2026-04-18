@@ -73,7 +73,6 @@ pub struct QuantCB<B: Backend> {
     pub loop_block: QuantCBLayer<B>, 
     pub attn_res: AttnRes<B>,
     pub norm_f: RmsNorm<B>,
-    // This MUST be BitLinear to share with MTP
     pub output: BitLinear<B>, 
     pub mtp: MultiTokenPrediction<B>, 
     pub hallucination_probe: BitLinear<B>,
@@ -101,10 +100,12 @@ impl<B: Backend> QuantCB<B> {
         (x, total_routing_loss, updated_caches)
     }
 
+    // FIX: Added current_loop_depth to signature
     pub fn forward(
         &self, 
         input: Tensor<B, 2, Int>,
-        caches: Option<Vec<Option<KVCache<B>>>>
+        caches: Option<Vec<Option<KVCache<B>>>>,
+        current_loop_depth: usize,
     ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>, Tensor<B, 3>) {
         let x_emb = self.token_embedding.forward(input);
         let [batch_size, seq_len, _] = x_emb.dims();
@@ -113,22 +114,23 @@ impl<B: Backend> QuantCB<B> {
         let mut current_input = x_emb.clone();
         let mut gate = Tensor::<B, 3>::zeros([batch_size, seq_len, 1], &device);
         let mut total_aux_loss = Tensor::<B, 1>::zeros([1], &device);
-        let mut history: Vec<Tensor<B, 3>> = Vec::with_capacity(self.loop_depth);
+        
+        // Use current_loop_depth for history allocation
+        let mut history: Vec<Tensor<B, 3>> = Vec::with_capacity(current_loop_depth);
 
         let active_caches = caches.unwrap_or_else(|| KVCache::init_empty_list(self.layers.len()));
 
         // --- Ternary Iterative Latent Reasoning ---
-        for _ in 0..self.loop_depth {
+        // FIX: Loop now respects the dynamic depth passed from the scheduler
+        for _ in 0..current_loop_depth {
             let (h_out, routing_loss, _) = self.loop_block.forward(current_input.clone(), None);
             total_aux_loss = total_aux_loss + routing_loss;
             
             let h_refined = self.attn_res.forward(h_out, &history);
             history.push(h_refined.clone());
 
-            // Thinking gate is now a ternary projection
             gate = sigmoid(self.thinking_gate.forward(h_refined.clone()));
             
-            // Entropy Regularization
             let p_safe = gate.clone().clamp(1e-7, 1.0 - 1e-7);
             let one_minus_p_safe = p_safe.clone().neg().add_scalar(1.0);
             let gate_entropy = (p_safe.clone().mul(p_safe.log()).neg() + one_minus_p_safe.clone().mul(one_minus_p_safe.log()).neg()).mean(); 
@@ -142,7 +144,6 @@ impl<B: Backend> QuantCB<B> {
 
         let h_base = self.norm_f.forward(x_final);
         
-        // Both heads are now BitLinear
         let logits = self.output.forward(h_base.clone());
         let probe_logits = self.hallucination_probe.forward(h_base.clone());
         let hallucination_probs = sigmoid(probe_logits);
@@ -150,16 +151,18 @@ impl<B: Backend> QuantCB<B> {
         (logits, hallucination_probs, gate, total_aux_loss, final_caches, h_base)
     }
 
+    // FIX: Added current_loop_depth to signature to match Trainer call
     pub fn forward_mtp(
         &self,
         input: Tensor<B, 2, Int>,
         targets: Tensor<B, 2, Int>,
-        caches: Option<Vec<Option<KVCache<B>>>>
+        caches: Option<Vec<Option<KVCache<B>>>>,
+        current_loop_depth: usize,
     ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 1>, Vec<Option<KVCache<B>>>) {
+        // Pass dynamic depth through to base forward
         let (main_logits, hallucination_probs, gate, total_aux_loss, final_caches, h_base) = 
-            self.forward(input, caches);
+            self.forward(input, caches, current_loop_depth);
 
-        // Shared head sharing (&self.output) now works because both are BitLinear
         let (mtp_logits, mtp_loss) = self.mtp.forward(
             h_base,
             targets,
