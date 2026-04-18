@@ -12,23 +12,32 @@ pub struct TrainingConfig {
     pub model: QuantCBConfig,
     pub optimizer: AdamConfig,
 
-    // --- BITNET 1.58-BIT CORE & STABILIZATION ---
+    // --- BITNET 1.58-BIT CORE ---
     #[config(default = 8)]
-    pub activation_bits: usize, // BitNet b1.58 usually uses 8-bit activations
+    pub activation_bits: usize, 
     #[config(default = 1e-5)]
     pub quant_eps: f32,
-    
-    /// The starting temperature for logit scaling (Early training gradient flow)
     #[config(default = 8.0)]
     pub min_temp: f32,
-    
-    /// The target temperature for logit scaling (Late training BitNet stability)
     #[config(default = 15.0)]
     pub max_temp: f32,
 
-    // --- TOKENIZER ---
-    #[config(default = 8192)]
-    pub tokenizer_vocab_size: usize,
+    // --- BLT: BYTE LATENT TRANSFORMER ---
+    // The vocab is strictly the 256 byte values + special tags
+    #[config(default = 262)] 
+    pub byte_vocab_size: usize,
+    
+    // The hidden dimension of the small, fast local encoder
+    #[config(default = 128)]
+    pub local_dim: usize,
+    
+    // The threshold at which uncertainty (entropy) forces a new patch
+    #[config(default = 0.65)]
+    pub entropy_threshold: f32,
+    
+    // Hard limits on patch sizes to prevent OOM
+    #[config(default = 16)]
+    pub max_patch_bytes: usize,
 
     // --- MIXTURE OF EXPERTS ---
     #[config(default = 8)]
@@ -55,19 +64,14 @@ pub struct TrainingConfig {
     // --- STABLE CORE HYPERPARAMETERS ---
     #[config(default = 8e-4)]
     pub learning_rate: f64,
-    
     #[config(default = 1.0)]
     pub clip_grad_norm: f64, 
-    
-    #[config(default = 16)] 
+    #[config(default = 8)] // Back to 8 assuming VRAM holds
     pub batch_size: usize,
-    
-    #[config(default = 512)]
+    #[config(default = 512)] // This now refers to 512 PATCHES, not bytes. Huge context upgrade.
     pub seq_len: usize,
-   
     #[config(default = 20000)]
     pub max_iterations: usize,
-    
     #[config(default = 42)]
     pub seed: u64,
 }

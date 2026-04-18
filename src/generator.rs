@@ -1,27 +1,36 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, Int, ElementConversion};
 use crate::model::QuantCB; 
-use crate::training::BPETokenizer;
+use crate::training::BLTPatcher;
 
 pub struct TextGenerator;
 
 impl TextGenerator {
     pub fn generate<B: Backend>(
         model: &QuantCB<B>,
-        tokenizer: &BPETokenizer,
+        patcher: &BLTPatcher<B>, // Un-ignored patcher parameter
         device: &B::Device,
         prompt: &str,
         max_tokens: usize,
         temperature: f32,
         rep_penalty: f32, 
     ) -> String {
-        let mut tokens = tokenizer.encode(prompt); 
-        let vocab_size_actual = tokenizer.vocab_size();
+        let vocab_size_actual = 262; 
+        
+        // --- BLT PATCHER INTEGRATION ---
+        // We segment the initial prompt using the BLT patcher logic
+        let dummy_entropies = vec![0.0; prompt.len()];
+        let patches = patcher.patch(prompt, &dummy_entropies);
+        
+        // Flatten the segments back out into our token sequence
+        let mut tokens: Vec<u32> = patches.into_iter()
+            .flat_map(|p| p.raw_bytes.into_iter().map(|b| b as u32))
+            .collect();
+        // -------------------------------
         
         for _ in 0..max_tokens {
             let context_len = tokens.len();
             
-            // Build input tensor from current token list
             let data_vec: Vec<B::IntElem> = tokens
                 .iter()
                 .map(|&t| (t as i64).elem())
@@ -32,10 +41,13 @@ impl TextGenerator {
                 device,
             ); 
 
-            // Dummy targets for MTP (required by the signature, though not used for loss here)
+            // --- BLT LOCAL ENCODER INTEGRATION ---
+            // Pass the input tensor through the patcher's forward method.
+            let _local_features = patcher.forward(input_tensor.clone());
+            // -------------------------------------
+
             let dummy: Tensor<B, 2, Int> = Tensor::zeros([1, context_len], device);
             
-            // FIX: Pass model.loop_depth as the 4th argument to satisfy the new signature
             let (logits, _, _, _, _, _, _) = model.forward_mtp(
                 input_tensor, 
                 dummy, 
@@ -43,7 +55,6 @@ impl TextGenerator {
                 model.loop_depth
             );
             
-            // Fix E0282: Explicitly type the dims array
             let [batch, seq_len, vocab_size]: [usize; 3] = logits.dims();
             let last_logits_tensor = logits
                 .slice([0..batch, (seq_len - 1)..seq_len, 0..vocab_size])
@@ -88,6 +99,7 @@ impl TextGenerator {
             tokens.push(next_token as u32);
         }
         
-        tokenizer.decode(&tokens)
+        let byte_output: Vec<u8> = tokens.iter().map(|&t| t as u8).collect();
+        String::from_utf8_lossy(&byte_output).to_string()
     }
 }

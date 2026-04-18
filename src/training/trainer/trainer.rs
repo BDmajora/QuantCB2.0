@@ -15,7 +15,7 @@ use crate::training::trainer::trainer_config::{
 use crate::model::config::QuantCBConfig;
 use crate::model::QuantCB; 
 use crate::training::trainer::batcher::{QuantCBBatch, QuantCBBatcher};
-use crate::training::BPETokenizer; 
+use crate::training::tokenizer::BLTPatcher; 
 use crate::training::data::training_data::VolatileDataPipeline;
 use crate::generator::TextGenerator; 
 use crate::training::data::learning::DynamicScheduler;
@@ -38,23 +38,18 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         Self { model, optimizer, lr, entropy_reg_weight, mtp_loss_weight }
     }
 
-    // FIX: Added temperature parameter to support dynamic scaling from learning.rs
     pub fn train_step(
         &mut self, 
         batch: QuantCBBatch<B>, 
         current_loop_depth: usize, 
         temperature: f32
     ) -> f32 {
-        // Pass current_loop_depth into forward_mtp
         let (main_logits, _, mtp_loss, _, _, aux_loss, _) = 
             self.model.forward_mtp(batch.inputs, batch.targets.clone(), None, current_loop_depth);
 
         let [batch_size, seq_len, vocab_size] = main_logits.dims();
         let num_elements = (batch_size * seq_len) as f32;
         
-        // 1. BitNet Stabilization (Dynamic Temperature Scaling)
-        // Instead of hardcoded 15.0, we use the value provided by the scheduler to 
-        // manage gradient flow during early vs late training.
         let stabilized_logits = main_logits.div_scalar(temperature);
         
         let loss_fn = burn::nn::loss::CrossEntropyLossConfig::new()
@@ -65,7 +60,6 @@ impl<B: AutodiffBackend, O: Optimizer<QuantCB<B>, B>> QuantCBTrainer<B, O> {
         
         let base_loss = loss_fn.forward(logits_flat, targets_flat);
         
-        // 2. Auxiliary Losses
         let normalized_mtp = mtp_loss.div_scalar(num_elements);
         let normalized_aux = aux_loss.div_scalar(num_elements);
 
@@ -96,12 +90,15 @@ pub async fn run() {
     let mut pipeline = VolatileDataPipeline::new();
     let checkpoints = CheckpointManager::new("./modeloutputs");
 
-    let raw_shakespeare = pipeline.load_shakespeare(&config).await;
+    let _raw_shakespeare = pipeline.load_shakespeare(&config).await;
+    
+    // --- BLT ARCHITECTURE INITIALIZATION ---
     let special_tags = vec![TAG_TRUTH, TAG_HALLUCINATE, TAG_SHAKESPEARE, TAG_WIKI];
     
-    let mut tokenizer = BPETokenizer::new(&special_tags);
-    tokenizer.train(&raw_shakespeare, config.tokenizer_vocab_size);
-    config.model = config.model.with_vocab_size(tokenizer.vocab_size());
+    // Initialize patcher on the Inner Backend (Wgpu)
+    let patcher = BLTPatcher::<Wgpu>::new(config.entropy_threshold, special_tags, &device);
+    
+    config.model = config.model.with_vocab_size(config.byte_vocab_size); 
 
     let (model, optimizer) = checkpoints.load_or_init::<TrainBackend>(&config, &device);
     let (mut step, resumed_lr, resumed_mtp, resumed_wake_ups) = 
@@ -129,9 +126,8 @@ pub async fn run() {
     pipeline.start_huggingface_chunker(&config);
     let mut t0 = Instant::now();
 
-    // Initialize trackers for dynamic values
     let mut current_loop_depth = 1;
-    let mut current_temp = config.min_temp; // Start at lower temp for higher gradient flow
+    let mut current_temp = config.min_temp; 
 
     println!("\n--- Launching QuantCB 2.0 Optimized Loop ---");
 
@@ -144,28 +140,40 @@ pub async fn run() {
             pipeline.get_next_wiki_text().await 
         };
         
-        streamer.push(tokenizer.encode(&text).into_iter().map(|id| id as usize).collect());
+        // --- BLT PATCHER INTEGRATION ---
+        let dummy_entropies = vec![0.0; text.len()];
+        let patches = patcher.patch(&text, &dummy_entropies);
+        
+        let patched_bytes: Vec<usize> = patches.into_iter()
+            .flat_map(|patch| patch.raw_bytes.into_iter().map(|b| b as usize))
+            .collect();
+            
+        streamer.push(patched_bytes);
 
         if let Some(batch_items) = streamer.get_next_batch() {
-            // FIX: Pass current_temp along with depth to the train step
+            let batch = batcher.batch(batch_items);
+            
+            // --- BLT LOCAL ENCODER INTEGRATION ---
+            // FIX: Use .inner() to convert Tensor<Autodiff<Wgpu>> to Tensor<Wgpu>
+            // to match the patcher's backend and silence the E0308 error.
+            let _local_features = patcher.forward(batch.inputs.clone().inner());
+
             let loss = trainer.train_step(
-                batcher.batch(batch_items), 
+                batch, 
                 current_loop_depth, 
                 current_temp
             );
             
-            // Update scheduler and capture all dynamically adjusted states
             let state = scheduler.step(loss);
             trainer.lr = state.lr;
             trainer.mtp_loss_weight = state.mtp_weight;
             current_loop_depth = state.loop_depth;
-            current_temp = state.temperature; // Capture dynamic temperature
+            current_temp = state.temperature; 
             
             if step % 10 == 0 {
                 let elapsed = t0.elapsed().as_secs_f64().max(0.001);
                 let tps = (config.batch_size * config.seq_len * 10) as f64 / elapsed;
                 
-                // Track 'Temp' and 'Depth' in console output
                 println!(
                     "Step {:4} | Loss: {:.4} | LR: {:.2e} | Temp: {:.1} | Depth: {} | MTP: {:.3} | Wakes: {} | TPS: {:.0}", 
                     step, loss, trainer.lr, current_temp, current_loop_depth, trainer.mtp_loss_weight, scheduler.wake_ups, tps
@@ -174,7 +182,7 @@ pub async fn run() {
             }
 
             if step > 0 && step % 100 == 0 { 
-                run_sample_block(step, &trainer.model, &tokenizer, &device); 
+                run_sample_block(step, &trainer.model, &patcher, &device); 
             }
 
             if step > 0 && step % 500 == 0 {
@@ -196,15 +204,15 @@ pub async fn run() {
 fn run_sample_block<B: AutodiffBackend>(
     step: usize, 
     model: &QuantCB<B>, 
-    tokenizer: &BPETokenizer, 
+    patcher: &BLTPatcher<B::InnerBackend>,
     device: &B::Device
 ) {
     let mode = SampleMode::get_for_step(step, 100);
     let prompt = mode.build_prompt(TAG_TRUTH);
     
     let valid_model = model.clone().valid();
-    // During sample generation, we use the standard model loop_depth for "thinking"
-    let output = TextGenerator::generate(&valid_model, tokenizer, device, &prompt, 60, 0.8, 1.2);
+    
+    let output = TextGenerator::generate(&valid_model, patcher, device, &prompt, 60, 0.8, 1.2);
     
     println!("\n[Step {} - {}]\n>> {}\n", step, mode.name, output);
 }
