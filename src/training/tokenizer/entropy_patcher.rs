@@ -8,7 +8,7 @@ pub struct BytePatch {
 pub struct EntropyPatcher {
     pub entropy_threshold: f32,
     pub max_patch_size: usize,
-    pub special_tags: Vec<Vec<u8>>, // Store as bytes now
+    pub special_tags: Vec<Vec<u8>>, 
 }
 
 impl EntropyPatcher {
@@ -16,18 +16,28 @@ impl EntropyPatcher {
         Self {
             entropy_threshold,
             max_patch_size,
-            // Convert strings to byte vectors once at initialization
             special_tags: special_tags.iter().map(|s| s.as_bytes().to_vec()).collect(),
         }
     }
 
+    /// Uses the internal default threshold
     pub fn segment_into_patches(&self, text: &str, byte_entropies: &[f32]) -> Vec<BytePatch> {
-        let bytes = text.as_bytes(); // Work directly with bytes
+        self.segment_with_threshold(text, byte_entropies, self.entropy_threshold)
+    }
+
+    /// The new core logic that accepts a dynamic threshold from the scheduler
+    pub fn segment_with_threshold(
+        &self, 
+        text: &str, 
+        byte_entropies: &[f32], 
+        threshold: f32
+    ) -> Vec<BytePatch> {
+        let bytes = text.as_bytes();
         let mut patches = Vec::new();
         let mut i = 0;
 
         while i < bytes.len() {
-            // 1. Check for special tags (using byte slice comparison)
+            // 1. Check for special tags
             let mut matched_tag_len = None;
             for tag in &self.special_tags {
                 if bytes[i..].starts_with(tag) {
@@ -55,11 +65,11 @@ impl EntropyPatcher {
                 let entropy = byte_entropies.get(i).cloned().unwrap_or(0.0);
                 current_patch.push(b);
 
-                let hit_entropy = entropy > self.entropy_threshold;
+                // FIX: Use the 'threshold' argument passed into the function, NOT self.entropy_threshold
+                let hit_entropy = entropy > threshold;
                 let hit_limit = current_patch.len() >= self.max_patch_size;
                 let is_boundary = b == b' ' || b == b'\n' || b == b'\t';
 
-                // Lookahead to prevent consuming the start of a special tag
                 let next_idx = i + 1;
                 let next_is_tag = if next_idx < bytes.len() {
                     self.special_tags.iter().any(|t| bytes[next_idx..].starts_with(t))

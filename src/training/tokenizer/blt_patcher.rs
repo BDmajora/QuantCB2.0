@@ -16,13 +16,23 @@ impl<B: Backend> BLTPatcher<B> {
         }
     }
 
+    /// Normal patching using default config
     pub fn patch(&self, text: &str, byte_entropies: &[f32]) -> Vec<BytePatch> {
-        // Reads 'self.patcher' and calls its method
         self.patcher.segment_into_patches(text, byte_entropies)
     }
 
+    /// Dynamic patching using the scheduler's threshold
+    pub fn patch_with_threshold(
+        &self, 
+        text: &str, 
+        byte_entropies: &[f32], 
+        threshold: f32
+    ) -> Vec<BytePatch> {
+        // Now calls the method we just added to EntropyPatcher
+        self.patcher.segment_with_threshold(text, byte_entropies, threshold)
+    }
+
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // Reads 'self.local_encoder' and calls its method
         self.local_encoder.forward(input)
     }
 }

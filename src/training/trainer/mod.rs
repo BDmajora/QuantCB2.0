@@ -4,3 +4,7 @@ pub mod streamer;
 pub mod trainer;
 pub mod trainer_config;
 pub mod batcher;
+pub mod sampler;
+pub mod core;
+pub mod data_stream;
+pub mod metrics;
